@@ -1,0 +1,6 @@
+[package]
+name = "crabby_space_institute"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
