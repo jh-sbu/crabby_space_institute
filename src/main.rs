@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    crabby_space_institute::run();
 }
