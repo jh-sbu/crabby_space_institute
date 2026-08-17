@@ -20,7 +20,7 @@ use super::{
     activate_stage, apply_editor_action, continue_quicksave, enter_vehicle_assembly,
     load_quicksave, return_to_assembly, save_quicksave,
 };
-use crate::model::{CraftBlueprint, ManeuverNode, SasMode, ValidationIssue, Vessel};
+use crate::model::{CraftBlueprint, ManeuverNode, PartCatalog, SasMode, ValidationIssue, Vessel};
 use crate::orbit::celestial_system;
 use crate::scripting::{COROUTINE_EXAMPLE, EXAMPLE_SCRIPT, ScriptMode, ScriptRuntime};
 use crate::simulation::{MissionProgress, SimulationClock, telemetry};
@@ -28,6 +28,7 @@ use crate::simulation::{MissionProgress, SimulationClock, telemetry};
 const DEFAULT_MCP_ADDR: &str = "127.0.0.1:8765";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_QUEUED_REQUESTS: usize = 64;
+const ATTITUDE_NORM_SQUARED_TOLERANCE: f64 = 1.0e-6;
 
 pub(super) struct GameMcpPlugin;
 
@@ -112,7 +113,7 @@ impl DebugGameState {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, catalog: &PartCatalog) -> Result<(), String> {
         if !self.clock.universal_time.is_finite() || self.clock.universal_time < 0.0 {
             return Err("clock.universal_time must be a finite, non-negative number".into());
         }
@@ -121,6 +122,14 @@ impl DebugGameState {
                 "clock.warp_index must be between 0 and {}",
                 SimulationClock::WARP_RATES.len() - 1
             ));
+        }
+        for (index, part) in self.craft.parts.iter().enumerate() {
+            if catalog.get(&part.definition_id).is_none() {
+                return Err(format!(
+                    "craft.parts[{index}].definition_id is unknown: {}",
+                    part.definition_id
+                ));
+            }
         }
 
         let Some(vessel) = &self.vessel else {
@@ -138,6 +147,10 @@ impl DebugGameState {
         if vessel.next_stage > vessel.stages.len() {
             return Err("vessel.next_stage cannot exceed vessel.stages.length".into());
         }
+        validate_finite_values("vessel.position", &vessel.position)?;
+        validate_finite_values("vessel.velocity", &vessel.velocity)?;
+        validate_attitude("vessel.attitude", &vessel.attitude)?;
+        validate_finite_values("vessel.angular_velocity", &vessel.angular_velocity)?;
         for (name, value) in [
             ("throttle", vessel.controls.throttle),
             ("pitch", vessel.controls.pitch),
@@ -153,11 +166,45 @@ impl DebugGameState {
                 return Err(format!("vessel.controls.{name} is outside its valid range"));
             }
         }
-        let attitude_length_squared: f64 = vessel.attitude.iter().map(|value| value * value).sum();
-        if attitude_length_squared <= f64::EPSILON {
-            return Err("vessel.attitude must be a non-zero quaternion".into());
+        for (index, part) in vessel.parts.iter().enumerate() {
+            if !part.fuel.is_finite() {
+                return Err(format!("vessel.parts[{index}].fuel must be finite"));
+            }
+        }
+        for (debris_index, debris) in vessel.debris.iter().enumerate() {
+            let path = format!("vessel.debris[{debris_index}]");
+            validate_finite_values(&format!("{path}.position"), &debris.position)?;
+            validate_finite_values(&format!("{path}.velocity"), &debris.velocity)?;
+            validate_attitude(&format!("{path}.attitude"), &debris.attitude)?;
+            validate_finite_values(
+                &format!("{path}.angular_velocity"),
+                &debris.angular_velocity,
+            )?;
+            for (part_index, part) in debris.parts.iter().enumerate() {
+                if !part.fuel.is_finite() {
+                    return Err(format!("{path}.parts[{part_index}].fuel must be finite"));
+                }
+            }
         }
         Ok(())
+    }
+}
+
+fn validate_finite_values(path: &str, values: &[f64]) -> Result<(), String> {
+    if values.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(format!("{path} must contain only finite numbers"))
+    }
+}
+
+fn validate_attitude(path: &str, attitude: &[f64; 4]) -> Result<(), String> {
+    validate_finite_values(path, attitude)?;
+    let norm_squared: f64 = attitude.iter().map(|value| value * value).sum();
+    if (norm_squared - 1.0).abs() <= ATTITUDE_NORM_SQUARED_TOLERANCE {
+        Ok(())
+    } else {
+        Err(format!("{path} must be a normalized quaternion"))
     }
 }
 
@@ -529,7 +576,7 @@ fn apply_patch_request(
     merge_patch(&mut value, Value::Object(patch));
     let patched = serde_json::from_value::<DebugGameState>(value)
         .map_err(|error| format!("patch does not produce a valid game state: {error}"))?;
-    patched.validate()?;
+    patched.validate(catalog)?;
     next_state.set(patched.mode);
     *clock = patched.clock;
     session.craft = patched.craft;
@@ -1110,10 +1157,12 @@ fn publish_game_state(
             ReplyKind::InspectGame | ReplyKind::Patch | ReplyKind::Action(_)
         )
     });
-    let needs_player = pending
-        .0
-        .iter()
-        .any(|reply| matches!(reply.kind, ReplyKind::InspectPlayer | ReplyKind::Action(_)));
+    let needs_player = pending.0.iter().any(|reply| {
+        matches!(
+            reply.kind,
+            ReplyKind::InspectPlayer | ReplyKind::Patch | ReplyKind::Action(_)
+        )
+    });
     let game = needs_game.then(|| {
         serde_json::to_value(DebugGameState::capture(*state.get(), &session, &clock))
             .expect("game state is serializable")
@@ -1137,7 +1186,13 @@ fn publish_game_state(
                 Ok(player.clone().expect("player snapshot captured"))
             }
             (ReplyKind::Patch, Ok(())) => Ok(game.clone().expect("game snapshot captured")),
-            (ReplyKind::Patch, Err(error)) => Err(error),
+            (ReplyKind::Patch, Err(error)) => Ok(json!({
+                "action": "patch_game_state",
+                "status": "rejected",
+                "error": error,
+                "game_state": game.as_ref().expect("game snapshot captured"),
+                "player_state": player.as_ref().expect("player snapshot captured"),
+            })),
             (ReplyKind::Action(action), Ok(())) => Ok(json!({
                 "action": action,
                 "status": "completed",
@@ -1455,10 +1510,70 @@ mod tests {
     #[test]
     fn validation_rejects_an_out_of_range_warp_index() {
         let session = Session::default();
+        let catalog = PartCatalog::default();
         let mut state =
             DebugGameState::capture(AppMode::Menu, &session, &SimulationClock::default());
         state.clock.warp_index = SimulationClock::WARP_RATES.len();
-        assert!(state.validate().unwrap_err().contains("warp_index"));
+        assert!(state.validate(&catalog).unwrap_err().contains("warp_index"));
+    }
+
+    #[test]
+    fn validation_rejects_non_finite_flight_state() {
+        let catalog = PartCatalog::default();
+        let mut session = Session::default();
+        session.vessel = Some(Vessel::from_blueprint(&session.craft, &catalog));
+        let state = DebugGameState::capture(AppMode::Flight, &session, &SimulationClock::default());
+
+        let mut invalid = state.clone();
+        invalid.vessel.as_mut().unwrap().position[0] = f64::NAN;
+        assert!(invalid.validate(&catalog).unwrap_err().contains("position"));
+
+        let mut invalid = state.clone();
+        invalid.vessel.as_mut().unwrap().velocity[0] = f64::INFINITY;
+        assert!(invalid.validate(&catalog).unwrap_err().contains("velocity"));
+
+        let mut invalid = state.clone();
+        invalid.vessel.as_mut().unwrap().angular_velocity[0] = f64::NAN;
+        assert!(
+            invalid
+                .validate(&catalog)
+                .unwrap_err()
+                .contains("angular_velocity")
+        );
+
+        let mut invalid = state;
+        invalid.vessel.as_mut().unwrap().parts[0].fuel = f64::NAN;
+        assert!(invalid.validate(&catalog).unwrap_err().contains("fuel"));
+    }
+
+    #[test]
+    fn validation_requires_normalized_attitudes() {
+        let catalog = PartCatalog::default();
+        let mut session = Session::default();
+        session.vessel = Some(Vessel::from_blueprint(&session.craft, &catalog));
+        let mut state =
+            DebugGameState::capture(AppMode::Flight, &session, &SimulationClock::default());
+        state.vessel.as_mut().unwrap().attitude = [0.0, 0.0, 0.0, 2.0];
+
+        assert!(
+            state
+                .validate(&catalog)
+                .unwrap_err()
+                .contains("normalized quaternion")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_unknown_craft_part_definitions() {
+        let catalog = PartCatalog::default();
+        let session = Session::default();
+        let mut state =
+            DebugGameState::capture(AppMode::Menu, &session, &SimulationClock::default());
+        state.craft.parts[0].definition_id = "missing_part".into();
+
+        let error = state.validate(&catalog).unwrap_err();
+        assert!(error.contains("craft.parts[0].definition_id"));
+        assert!(error.contains("missing_part"));
     }
 
     #[test]
@@ -1501,6 +1616,36 @@ mod tests {
         let value = response.blocking_recv().unwrap().unwrap();
         assert_eq!(value["notice"], "patched through MCP");
         assert!(app.world().resource::<SimulationClock>().paused);
+    }
+
+    #[tokio::test]
+    async fn patch_failures_return_structured_rejections() {
+        let bridge = GameStateBridge::default();
+        let mut app = test_app(bridge.clone());
+        app.update();
+        let (reply, response) = oneshot::channel();
+        bridge
+            .requests
+            .lock()
+            .unwrap()
+            .push_back(McpRequest::Patch {
+                patch: serde_json::from_value(json!({
+                    "clock": { "warp_index": SimulationClock::WARP_RATES.len() }
+                }))
+                .unwrap(),
+                reply,
+            });
+        app.update();
+
+        let result = GameStateMcp::new(bridge).await_response(response).await;
+        let structured = result
+            .structured_content
+            .expect("patch rejection should have structured content");
+        assert_eq!(structured["action"], "patch_game_state");
+        assert_eq!(structured["status"], "rejected");
+        assert!(structured["error"].as_str().unwrap().contains("warp_index"));
+        assert!(structured.get("game_state").is_some());
+        assert!(structured.get("player_state").is_some());
     }
 
     #[test]
