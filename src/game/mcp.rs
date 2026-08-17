@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
@@ -27,6 +27,7 @@ use crate::simulation::{MissionProgress, SimulationClock, telemetry};
 
 const DEFAULT_MCP_ADDR: &str = "127.0.0.1:8765";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_QUEUED_REQUESTS: usize = 64;
 
 pub(super) struct GameMcpPlugin;
 
@@ -41,28 +42,18 @@ impl Plugin for GameMcpPlugin {
     }
 }
 
-#[derive(Clone, Resource)]
+#[derive(Clone, Default, Resource)]
 struct GameStateBridge {
-    game_snapshot: Arc<RwLock<Value>>,
-    player_snapshot: Arc<RwLock<Value>>,
     requests: Arc<Mutex<VecDeque<McpRequest>>>,
 }
 
-impl Default for GameStateBridge {
-    fn default() -> Self {
-        let starting = json!({
-            "status": "starting",
-            "message": "The game has not completed its first update yet"
-        });
-        Self {
-            game_snapshot: Arc::new(RwLock::new(starting.clone())),
-            player_snapshot: Arc::new(RwLock::new(starting)),
-            requests: Arc::default(),
-        }
-    }
-}
-
 enum McpRequest {
+    InspectGame {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    InspectPlayer {
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Patch {
         patch: Map<String, Value>,
         reply: oneshot::Sender<Result<Value, String>>,
@@ -84,6 +75,8 @@ enum GameAction {
 }
 
 enum ReplyKind {
+    InspectGame,
+    InspectPlayer,
     Patch,
     Action(String),
 }
@@ -454,16 +447,23 @@ fn process_mcp_requests(
 ) {
     // Process one request per frame so a queued mode transition is authoritative
     // before the next FIFO action validates its required mode.
-    let request = bridge
-        .requests
-        .lock()
-        .expect("MCP request queue poisoned")
-        .pop_front();
-    let Some(request) = request else {
-        return;
+    let request = loop {
+        let request = bridge
+            .requests
+            .lock()
+            .expect("MCP request queue poisoned")
+            .pop_front();
+        let Some(request) = request else {
+            return;
+        };
+        if !request.reply_is_closed() {
+            break request;
+        }
     };
 
     let (kind, result, reply) = match request {
+        McpRequest::InspectGame { reply } => (ReplyKind::InspectGame, Ok(()), reply),
+        McpRequest::InspectPlayer { reply } => (ReplyKind::InspectPlayer, Ok(()), reply),
         McpRequest::Patch { patch, reply } => (
             ReplyKind::Patch,
             apply_patch_request(
@@ -503,6 +503,17 @@ fn process_mcp_requests(
         result,
         reply,
     });
+}
+
+impl McpRequest {
+    fn reply_is_closed(&self) -> bool {
+        match self {
+            Self::InspectGame { reply }
+            | Self::InspectPlayer { reply }
+            | Self::Patch { reply, .. }
+            | Self::Action { reply, .. } => reply.is_closed(),
+        }
+    }
 }
 
 fn apply_patch_request(
@@ -1077,7 +1088,6 @@ fn capture_player_state(
 }
 
 fn publish_game_state(
-    bridge: Res<GameStateBridge>,
     state: Res<State<AppMode>>,
     session: Res<Session>,
     catalog: Res<Catalog>,
@@ -1089,43 +1099,59 @@ fn publish_game_state(
     remote_input: Res<RemoteFlightInput>,
     mut pending: ResMut<PendingReplies>,
 ) {
-    let game = serde_json::to_value(DebugGameState::capture(*state.get(), &session, &clock))
-        .expect("game state is serializable");
-    let player = capture_player_state(
-        *state.get(),
-        &catalog,
-        &store,
-        &editor,
-        &view,
-        &runtime,
-        &remote_input,
-    );
-    *bridge
-        .game_snapshot
-        .write()
-        .expect("MCP game snapshot poisoned") = game.clone();
-    *bridge
-        .player_snapshot
-        .write()
-        .expect("MCP player snapshot poisoned") = player.clone();
+    pending.0.retain(|reply| !reply.reply.is_closed());
+    if pending.0.is_empty() {
+        return;
+    }
+
+    let needs_game = pending.0.iter().any(|reply| {
+        matches!(
+            reply.kind,
+            ReplyKind::InspectGame | ReplyKind::Patch | ReplyKind::Action(_)
+        )
+    });
+    let needs_player = pending
+        .0
+        .iter()
+        .any(|reply| matches!(reply.kind, ReplyKind::InspectPlayer | ReplyKind::Action(_)));
+    let game = needs_game.then(|| {
+        serde_json::to_value(DebugGameState::capture(*state.get(), &session, &clock))
+            .expect("game state is serializable")
+    });
+    let player = needs_player.then(|| {
+        capture_player_state(
+            *state.get(),
+            &catalog,
+            &store,
+            &editor,
+            &view,
+            &runtime,
+            &remote_input,
+        )
+    });
 
     while let Some(pending_reply) = pending.0.pop_front() {
         let value = match (pending_reply.kind, pending_reply.result) {
-            (ReplyKind::Patch, Ok(())) => Ok(game.clone()),
+            (ReplyKind::InspectGame, Ok(())) => Ok(game.clone().expect("game snapshot captured")),
+            (ReplyKind::InspectPlayer, Ok(())) => {
+                Ok(player.clone().expect("player snapshot captured"))
+            }
+            (ReplyKind::Patch, Ok(())) => Ok(game.clone().expect("game snapshot captured")),
             (ReplyKind::Patch, Err(error)) => Err(error),
             (ReplyKind::Action(action), Ok(())) => Ok(json!({
                 "action": action,
                 "status": "completed",
-                "game_state": game,
-                "player_state": player,
+                "game_state": game.as_ref().expect("game snapshot captured"),
+                "player_state": player.as_ref().expect("player snapshot captured"),
             })),
             (ReplyKind::Action(action), Err(error)) => Ok(json!({
                 "action": action,
                 "status": "rejected",
                 "error": error,
-                "game_state": game,
-                "player_state": player,
+                "game_state": game.as_ref().expect("game snapshot captured"),
+                "player_state": player.as_ref().expect("player snapshot captured"),
             })),
+            (ReplyKind::InspectGame | ReplyKind::InspectPlayer, Err(error)) => Err(error),
         };
         let _ = pending_reply.reply.send(value);
     }
@@ -1173,6 +1199,27 @@ impl GameStateMcp {
         result
     }
 
+    fn enqueue(&self, request: McpRequest) -> Result<(), McpRequest> {
+        let mut requests = self
+            .bridge
+            .requests
+            .lock()
+            .expect("MCP request queue poisoned");
+        requests.retain(|request| !request.reply_is_closed());
+        if requests.len() >= MAX_QUEUED_REQUESTS {
+            Err(request)
+        } else {
+            requests.push_back(request);
+            Ok(())
+        }
+    }
+
+    fn busy_result() -> CallToolResult {
+        CallToolResult::error(vec![ContentBlock::text(format!(
+            "The game is busy; the MCP request queue is limited to {MAX_QUEUED_REQUESTS} requests"
+        ))])
+    }
+
     async fn await_response(
         &self,
         response: oneshot::Receiver<Result<Value, String>>,
@@ -1194,25 +1241,37 @@ impl GameStateMcp {
 
     async fn enqueue_patch(&self, patch: Map<String, Value>) -> CallToolResult {
         let (reply, response) = oneshot::channel();
-        self.bridge
-            .requests
-            .lock()
-            .expect("MCP request queue poisoned")
-            .push_back(McpRequest::Patch { patch, reply });
+        if self.enqueue(McpRequest::Patch { patch, reply }).is_err() {
+            return Self::busy_result();
+        }
         self.await_response(response).await
     }
 
     async fn enqueue_action(&self, name: String, action: GameAction) -> CallToolResult {
         let (reply, response) = oneshot::channel();
-        self.bridge
-            .requests
-            .lock()
-            .expect("MCP request queue poisoned")
-            .push_back(McpRequest::Action {
+        if self
+            .enqueue(McpRequest::Action {
                 name,
                 action,
                 reply,
-            });
+            })
+            .is_err()
+        {
+            return Self::busy_result();
+        }
+        self.await_response(response).await
+    }
+
+    async fn inspect(&self, player: bool) -> CallToolResult {
+        let (reply, response) = oneshot::channel();
+        let request = if player {
+            McpRequest::InspectPlayer { reply }
+        } else {
+            McpRequest::InspectGame { reply }
+        };
+        if self.enqueue(request).is_err() {
+            return Self::busy_result();
+        }
         self.await_response(response).await
     }
 }
@@ -1222,27 +1281,15 @@ impl GameStateMcp {
     #[tool(
         description = "Return an atomic snapshot of the live game state, including mode, simulation clock, craft blueprint, active vessel, mission progress, and UI notice"
     )]
-    fn inspect_game_state(&self) -> CallToolResult {
-        Self::result(
-            self.bridge
-                .game_snapshot
-                .read()
-                .expect("MCP game snapshot poisoned")
-                .clone(),
-        )
+    async fn inspect_game_state(&self) -> CallToolResult {
+        self.inspect(false).await
     }
 
     #[tool(
         description = "Return player-facing interaction state: assembly selection and catalog, saves, view state, Lua state, and latched MCP attitude controls"
     )]
-    fn inspect_player_state(&self) -> CallToolResult {
-        Self::result(
-            self.bridge
-                .player_snapshot
-                .read()
-                .expect("MCP player snapshot poisoned")
-                .clone(),
-        )
+    async fn inspect_player_state(&self) -> CallToolResult {
+        self.inspect(true).await
     }
 
     #[tool(
@@ -1593,5 +1640,73 @@ mod tests {
             AppMode::Menu
         );
         assert!(app.world().resource::<Session>().vessel.is_none());
+    }
+
+    #[test]
+    fn requests_whose_callers_are_gone_are_not_applied() {
+        let bridge = GameStateBridge::default();
+        let mut app = test_app(bridge.clone());
+        app.update();
+        run_request(
+            &mut app,
+            &bridge,
+            GameAction::Menu(MenuActionParams::OpenVehicleAssembly),
+            "menu.open_vehicle_assembly",
+        )
+        .unwrap();
+
+        let original_name = app.world().resource::<Session>().craft.name.clone();
+        let (reply, response) = oneshot::channel();
+        bridge
+            .requests
+            .lock()
+            .unwrap()
+            .push_back(McpRequest::Action {
+                name: "assembly.rename_craft".into(),
+                action: GameAction::Assembly(AssemblyActionParams::RenameCraft {
+                    name: "Timed-out mutation".into(),
+                }),
+                reply,
+            });
+        drop(response);
+
+        app.update();
+
+        assert_eq!(app.world().resource::<Session>().craft.name, original_name);
+        assert!(bridge.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_queue_rejects_work_at_its_limit() {
+        let bridge = GameStateBridge::default();
+        let mcp = GameStateMcp::new(bridge.clone());
+        let mut responses = Vec::new();
+
+        for _ in 0..MAX_QUEUED_REQUESTS {
+            let (reply, response) = oneshot::channel();
+            assert!(mcp.enqueue(McpRequest::InspectGame { reply }).is_ok());
+            responses.push(response);
+        }
+        let (reply, _response) = oneshot::channel();
+        assert!(mcp.enqueue(McpRequest::InspectGame { reply }).is_err());
+        assert_eq!(bridge.requests.lock().unwrap().len(), MAX_QUEUED_REQUESTS);
+    }
+
+    #[test]
+    fn inspection_is_captured_on_demand() {
+        let bridge = GameStateBridge::default();
+        let mut app = test_app(bridge.clone());
+        let (reply, response) = oneshot::channel();
+        bridge
+            .requests
+            .lock()
+            .unwrap()
+            .push_back(McpRequest::InspectGame { reply });
+
+        app.update();
+
+        let value = response.blocking_recv().unwrap().unwrap();
+        assert_eq!(value["mode"], json!(AppMode::Menu));
+        assert_eq!(value["notice"], "Welcome to the Institute, pilot.");
     }
 }
