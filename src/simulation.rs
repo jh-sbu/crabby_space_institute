@@ -15,6 +15,11 @@ use crate::orbit::{
 
 const G0: f64 = 9.80665;
 const ON_RAILS_CLEARANCE: f64 = 5_000.0;
+const SOI_CAPTURE_FACTOR: f64 = 0.98;
+const SOI_RELEASE_FACTOR: f64 = 1.01;
+const SOI_SWEEP_SEGMENT_FRACTION: f64 = 0.25;
+const SOI_SWEEP_MAX_SEGMENTS: usize = 4_096;
+const MAX_SOI_TRANSITIONS_PER_STEP: usize = 8;
 
 fn aerodynamic_lift_force(
     forward: DVec3,
@@ -607,7 +612,51 @@ pub fn step_on_rails(vessel: &mut Vessel, dt: f64) {
 
 pub fn step_on_rails_patched(vessel: &mut Vessel, ut: f64, dt: f64) {
     let previous_body = vessel.primary_body.clone();
-    step_on_rails(vessel, dt);
+    let mut elapsed = 0.0;
+    for _ in 0..MAX_SOI_TRANSITIONS_PER_STEP {
+        let remaining = dt - elapsed;
+        if remaining <= f64::EPSILON {
+            break;
+        }
+
+        let current = body_definition(&vessel.primary_body);
+        let transition = next_soi_transition(
+            vessel.position_vec(),
+            vessel.velocity_vec(),
+            &current,
+            ut + elapsed,
+            remaining,
+        );
+        let Some((transition_time, target, entering)) = transition else {
+            step_on_rails(vessel, remaining);
+            elapsed = dt;
+            break;
+        };
+
+        step_on_rails(vessel, transition_time);
+        if matches!(vessel.situation, FlightSituation::Crashed) {
+            return;
+        }
+
+        let transition_ut = ut + elapsed + transition_time;
+        let (body_position, body_velocity) = if entering {
+            circular_ephemeris(&target, current.mu, transition_ut)
+        } else {
+            circular_ephemeris(&current, target.mu, transition_ut)
+        };
+        if entering {
+            vessel.position = (vessel.position_vec() - body_position).to_array();
+            vessel.velocity = (vessel.velocity_vec() - body_velocity).to_array();
+        } else {
+            vessel.position = (body_position + vessel.position_vec()).to_array();
+            vessel.velocity = (body_velocity + vessel.velocity_vec()).to_array();
+        }
+        vessel.primary_body = target.id.into();
+        elapsed += transition_time;
+    }
+    if elapsed < dt && !matches!(vessel.situation, FlightSituation::Crashed) {
+        step_on_rails(vessel, dt - elapsed);
+    }
     if matches!(vessel.situation, FlightSituation::Crashed) {
         return;
     }
@@ -629,6 +678,194 @@ pub fn step_on_rails_patched(vessel: &mut Vessel, ut: f64, dt: f64) {
         && vessel.position_vec().dot(vessel.velocity_vec()) > 0.0
         && orbit.periapsis <= 5.0;
     update_on_rails_situation(vessel, crossed_surface_during_capture);
+}
+
+fn next_soi_transition(
+    position: DVec3,
+    velocity: DVec3,
+    current: &CelestialBodyDef,
+    ut: f64,
+    dt: f64,
+) -> Option<(f64, CelestialBodyDef, bool)> {
+    let entering = first_child_soi_encounter(position, velocity, current, ut, dt)
+        .map(|(time, child)| (time, child, true));
+    let exiting = current.parent.and_then(|parent_id| {
+        let parent = body_definition(parent_id);
+        current_soi_exit_time(position, velocity, current, &parent, dt)
+            .map(|time| (time, parent, false))
+    });
+
+    match (entering, exiting) {
+        (Some(entering), Some(exiting)) => Some(if entering.0 <= exiting.0 {
+            entering
+        } else {
+            exiting
+        }),
+        (Some(entering), None) => Some(entering),
+        (None, Some(exiting)) => Some(exiting),
+        (None, None) => None,
+    }
+}
+
+fn first_child_soi_encounter(
+    position: DVec3,
+    velocity: DVec3,
+    current: &CelestialBodyDef,
+    ut: f64,
+    dt: f64,
+) -> Option<(f64, CelestialBodyDef)> {
+    if dt <= 0.0 {
+        return None;
+    }
+
+    celestial_system()
+        .into_iter()
+        .filter(|body| body.parent == Some(current.id))
+        .filter_map(|child| {
+            child_soi_encounter_time(position, velocity, current, &child, ut, dt)
+                .map(|time| (time, child))
+        })
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+}
+
+fn child_soi_encounter_time(
+    position: DVec3,
+    velocity: DVec3,
+    current: &CelestialBodyDef,
+    child: &CelestialBodyDef,
+    ut: f64,
+    dt: f64,
+) -> Option<f64> {
+    let soi = sphere_of_influence(child.semi_major_axis, child.mu, current.mu) * SOI_CAPTURE_FACTOR;
+    let relative_state_at = |elapsed: f64| {
+        let (vessel_position, vessel_velocity) =
+            propagate_universal(position, velocity, current.mu, elapsed);
+        let (child_position, child_velocity) = circular_ephemeris(child, current.mu, ut + elapsed);
+        (
+            vessel_position - child_position,
+            vessel_velocity - child_velocity,
+        )
+    };
+
+    let (mut previous_position, start_velocity) = relative_state_at(0.0);
+    if previous_position.length() < soi {
+        return Some(0.0);
+    }
+    let (_, end_velocity) = relative_state_at(dt);
+    let estimated_travel = start_velocity.length().max(end_velocity.length()) * dt;
+    let segment_length = soi * SOI_SWEEP_SEGMENT_FRACTION;
+    let segments =
+        ((estimated_travel / segment_length).ceil() as usize).clamp(8, SOI_SWEEP_MAX_SEGMENTS);
+
+    let mut previous_time = 0.0;
+    for index in 1..=segments {
+        let time = dt * index as f64 / segments as f64;
+        let (relative_position, _) = relative_state_at(time);
+
+        // The chord is a cheap broad phase. Its closest point also catches a
+        // complete outside-to-outside crossing, unlike endpoint sampling.
+        if segment_distance_to_origin(previous_position, relative_position) < soi * 1.1 {
+            let closest_time = minimize_distance(previous_time, time, &relative_state_at);
+            if relative_state_at(closest_time).0.length() < soi {
+                let mut outside = previous_time;
+                let mut inside = closest_time;
+                if relative_state_at(outside).0.length() < soi {
+                    return Some(outside);
+                }
+                for _ in 0..48 {
+                    let midpoint = (outside + inside) * 0.5;
+                    if relative_state_at(midpoint).0.length() < soi {
+                        inside = midpoint;
+                    } else {
+                        outside = midpoint;
+                    }
+                }
+                return Some(inside);
+            }
+        }
+
+        previous_time = time;
+        previous_position = relative_position;
+    }
+    None
+}
+
+fn current_soi_exit_time(
+    position: DVec3,
+    velocity: DVec3,
+    current: &CelestialBodyDef,
+    parent: &CelestialBodyDef,
+    dt: f64,
+) -> Option<f64> {
+    let soi =
+        sphere_of_influence(current.semi_major_axis, current.mu, parent.mu) * SOI_RELEASE_FACTOR;
+    if position.length() > soi {
+        return Some(0.0);
+    }
+
+    let orbit = elements(position, velocity, current.mu, 0.0);
+    if orbit.apoapsis.is_finite() && orbit.apoapsis <= soi {
+        return None;
+    }
+
+    let (_, end_velocity) = propagate_universal(position, velocity, current.mu, dt);
+    let estimated_travel = velocity.length().max(end_velocity.length()) * dt;
+    let segment_length = soi * SOI_SWEEP_SEGMENT_FRACTION;
+    let segments =
+        ((estimated_travel / segment_length).ceil() as usize).clamp(8, SOI_SWEEP_MAX_SEGMENTS);
+    let mut previous_time = 0.0;
+
+    for index in 1..=segments {
+        let time = dt * index as f64 / segments as f64;
+        let (next_position, _) = propagate_universal(position, velocity, current.mu, time);
+        if next_position.length() > soi {
+            let mut inside = previous_time;
+            let mut outside = time;
+            for _ in 0..48 {
+                let midpoint = (inside + outside) * 0.5;
+                if propagate_universal(position, velocity, current.mu, midpoint)
+                    .0
+                    .length()
+                    > soi
+                {
+                    outside = midpoint;
+                } else {
+                    inside = midpoint;
+                }
+            }
+            return Some(outside);
+        }
+        previous_time = time;
+    }
+    None
+}
+
+fn segment_distance_to_origin(start: DVec3, end: DVec3) -> f64 {
+    let segment = end - start;
+    if segment.length_squared() <= f64::EPSILON {
+        return start.length();
+    }
+    let fraction = (-start.dot(segment) / segment.length_squared()).clamp(0.0, 1.0);
+    (start + segment * fraction).length()
+}
+
+fn minimize_distance(
+    mut start: f64,
+    mut end: f64,
+    relative_state_at: &impl Fn(f64) -> (DVec3, DVec3),
+) -> f64 {
+    for _ in 0..32 {
+        let first = start + (end - start) / 3.0;
+        let second = end - (end - start) / 3.0;
+        if relative_state_at(first).0.length_squared()
+            < relative_state_at(second).0.length_squared()
+        {
+            end = second;
+        } else {
+            start = first;
+        }
+    }
+    (start + end) * 0.5
 }
 
 /// Whether the vessel can safely take another analytic high-warp step.
@@ -748,7 +985,7 @@ pub fn apply_soi_transitions(vessel: &mut Vessel, ut: f64) {
     if let Some(parent_id) = current.parent {
         let parent = body_definition(parent_id);
         let soi = sphere_of_influence(current.semi_major_axis, current.mu, parent.mu);
-        if position.length() > soi * 1.01 {
+        if position.length() > soi * SOI_RELEASE_FACTOR {
             let (body_position, body_velocity) = circular_ephemeris(&current, parent.mu, ut);
             vessel.position = (body_position + position).to_array();
             vessel.velocity = (body_velocity + velocity).to_array();
@@ -763,7 +1000,7 @@ pub fn apply_soi_transitions(vessel: &mut Vessel, ut: f64) {
     {
         let soi = sphere_of_influence(child.semi_major_axis, child.mu, current.mu);
         let (child_position, child_velocity) = circular_ephemeris(&child, current.mu, ut);
-        if (position - child_position).length() < soi * 0.98 {
+        if (position - child_position).length() < soi * SOI_CAPTURE_FACTOR {
             vessel.position = (position - child_position).to_array();
             vessel.velocity = (velocity - child_velocity).to_array();
             vessel.primary_body = child.id.into();
@@ -901,6 +1138,42 @@ mod tests {
         apply_soi_transitions(&mut vessel, 0.0);
         assert_eq!(vessel.primary_body, "pelagos");
         assert!((vessel.position_vec() - (home_position + relative_position)).length() < 1e-4);
+    }
+
+    #[test]
+    fn swept_soi_detection_finds_a_grazing_encounter_between_warp_samples() {
+        let home = body_definition("carapace");
+        let moon = body_definition("selene");
+        let dt = SimulationClock::WARP_RATES[7] / 60.0;
+        let speed = 3_000.0;
+        let (moon_position, moon_velocity) = circular_ephemeris(&moon, home.mu, 0.0);
+        let capture_radius =
+            sphere_of_influence(moon.semi_major_axis, moon.mu, home.mu) * SOI_CAPTURE_FACTOR;
+        let impact_offset = moon_position.normalize() * capture_radius * 0.9;
+        let relative_position = impact_offset - DVec3::Z * speed * dt * 0.5;
+        let position = moon_position + relative_position;
+        let velocity = moon_velocity + DVec3::Z * speed;
+
+        let (end_position, uninterrupted_velocity) =
+            propagate_universal(position, velocity, home.mu, dt);
+        let (end_moon_position, _) = circular_ephemeris(&moon, home.mu, dt);
+        assert!(relative_position.length() > capture_radius);
+        assert!((end_position - end_moon_position).length() > capture_radius);
+
+        let encounter =
+            child_soi_encounter_time(position, velocity, &home, &moon, 0.0, dt).unwrap();
+        assert!(encounter > 0.0);
+        assert!(encounter < dt);
+
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        vessel.position = position.to_array();
+        vessel.velocity = velocity.to_array();
+        vessel.situation = FlightSituation::Orbiting;
+        step_on_rails_patched(&mut vessel, 0.0, dt);
+
+        assert_eq!(vessel.primary_body, "carapace");
+        assert!((vessel.velocity_vec() - uninterrupted_velocity).length() > 1.0);
     }
 
     #[test]
