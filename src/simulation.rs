@@ -26,6 +26,8 @@ const BROADSIDE_VERTICAL_IMPACT_LIMIT: f64 = 8.0;
 const HORIZONTAL_IMPACT_LIMIT: f64 = 8.0;
 const LANDING_LEG_VERTICAL_BONUS: f64 = 8.0;
 const LANDING_LEG_HORIZONTAL_BONUS: f64 = 3.0;
+const INLINE_COAXIAL_TOLERANCE: f64 = 0.05;
+const INLINE_AXIS_ALIGNMENT: f64 = 0.98;
 
 fn aerodynamic_lift_force(
     forward: DVec3,
@@ -39,6 +41,9 @@ fn aerodynamic_lift_force(
 
 fn projected_drag_area(
     definition: &PartDefinition,
+    part: &crate::model::RuntimePart,
+    vessel: &Vessel,
+    catalog: &PartCatalog,
     world_rotation: DQuat,
     air_direction: DVec3,
 ) -> f64 {
@@ -57,7 +62,55 @@ fn projected_drag_area(
             + local_direction.z.abs() * width * height
     } else {
         let axial = local_direction.y.abs();
-        PI * radius * radius * axial + 2.0 * radius * height * (1.0 - axial * axial).max(0.0).sqrt()
+        let position = DVec3::from_array(part.instance.local_position.map(f64::from));
+        let local_rotation = DQuat::from_array(part.instance.local_rotation.map(f64::from));
+        let axis = local_rotation * DVec3::Y;
+        let leading_sign = local_direction.y.signum();
+        let blocked_radius = if leading_sign == 0.0 {
+            0.0
+        } else {
+            vessel
+                .parts
+                .iter()
+                .filter(|neighbor| {
+                    !neighbor.destroyed
+                        && neighbor.instance.instance_id != part.instance.instance_id
+                        && (neighbor.instance.parent == Some(part.instance.instance_id)
+                            || part.instance.parent == Some(neighbor.instance.instance_id))
+                })
+                .filter_map(|neighbor| {
+                    let neighbor_definition = catalog.get(&neighbor.instance.definition_id)?;
+                    if neighbor_definition.radial
+                        || matches!(
+                            neighbor_definition.module,
+                            PartModule::Fin { .. }
+                                | PartModule::LandingLeg
+                                | PartModule::Rcs { .. }
+                        )
+                    {
+                        return None;
+                    }
+                    let neighbor_rotation =
+                        DQuat::from_array(neighbor.instance.local_rotation.map(f64::from));
+                    let neighbor_axis = neighbor_rotation * DVec3::Y;
+                    if axis.dot(neighbor_axis).abs() < INLINE_AXIS_ALIGNMENT {
+                        return None;
+                    }
+                    let neighbor_position =
+                        DVec3::from_array(neighbor.instance.local_position.map(f64::from));
+                    let offset = neighbor_position - position;
+                    if offset.dot(axis) * leading_sign <= 0.0
+                        || offset.reject_from(axis).length() > INLINE_COAXIAL_TOLERANCE
+                    {
+                        return None;
+                    }
+                    Some(f64::from(neighbor_definition.radius))
+                })
+                .fold(0.0, f64::max)
+                .min(radius)
+        };
+        PI * (radius * radius - blocked_radius * blocked_radius) * axial
+            + 2.0 * radius * height * (1.0 - axial * axial).max(0.0).sqrt()
     };
     area * definition.drag_coefficient
 }
@@ -257,12 +310,23 @@ pub struct CraftStats {
 
 pub fn craft_stats(craft: &CraftBlueprint, catalog: &PartCatalog) -> CraftStats {
     let mut stats = CraftStats::default();
+    let stats_vessel = Vessel::from_blueprint(craft, catalog);
+    let first_propulsion_stage = craft.stages.iter().find_map(|stage| {
+        let ids = stage
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                StageAction::ActivateEngine(id) => Some(*id),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        (!ids.is_empty()).then_some(ids)
+    });
     let mut weighted_mass_y = 0.0;
     let mut pressure_area = 0.0;
     let mut pressure_y = 0.0;
     let mut thrust_y = 0.0;
     let mut thrust_weight = 0.0;
-    let mut effective_isp_weighted = 0.0;
     for part in &craft.parts {
         let Some(def) = catalog.get(&part.definition_id) else {
             continue;
@@ -271,28 +335,43 @@ pub fn craft_stats(craft: &CraftBlueprint, catalog: &PartCatalog) -> CraftStats 
         let wet_part_mass = def.dry_mass + part_resource_capacity(def.module);
         stats.wet_mass += wet_part_mass;
         weighted_mass_y += wet_part_mass * part.local_position[1] as f64;
-        let area = PI * def.radius as f64 * def.radius as f64 * def.drag_coefficient;
+        let area = stats_vessel
+            .parts
+            .iter()
+            .find(|runtime| runtime.instance.instance_id == part.instance_id)
+            .map_or(0.0, |runtime| {
+                projected_drag_area(
+                    def,
+                    runtime,
+                    &stats_vessel,
+                    catalog,
+                    DQuat::from_array(part.local_rotation.map(f64::from)),
+                    DVec3::Y,
+                )
+            });
         pressure_area += area;
         pressure_y += area * part.local_position[1] as f64;
+        let contributes_initial_thrust = first_propulsion_stage
+            .as_ref()
+            .is_none_or(|ids| ids.contains(&part.instance_id));
         match def.module {
             PartModule::LiquidTank { fuel } => stats.liquid_fuel += fuel,
-            PartModule::SolidEngine { thrust, isp, fuel } => {
+            PartModule::SolidEngine { thrust, fuel, .. } => {
                 stats.solid_fuel += fuel;
-                stats.sea_level_thrust += thrust;
-                stats.vacuum_thrust += thrust;
-                effective_isp_weighted += thrust * isp;
-                thrust_y += thrust * part.local_position[1] as f64;
-                thrust_weight += thrust;
+                if contributes_initial_thrust {
+                    stats.sea_level_thrust += thrust;
+                    stats.vacuum_thrust += thrust;
+                    thrust_y += thrust * part.local_position[1] as f64;
+                    thrust_weight += thrust;
+                }
             }
             PartModule::LiquidEngine {
                 thrust_vac,
                 thrust_sl,
-                isp_vac,
                 ..
-            } => {
+            } if contributes_initial_thrust => {
                 stats.sea_level_thrust += thrust_sl;
                 stats.vacuum_thrust += thrust_vac;
-                effective_isp_weighted += thrust_vac * isp_vac;
                 thrust_y += thrust_vac * part.local_position[1] as f64;
                 thrust_weight += thrust_vac;
             }
@@ -315,15 +394,7 @@ pub fn craft_stats(craft: &CraftBlueprint, catalog: &PartCatalog) -> CraftStats 
         0.0
     };
     stats.sea_level_twr = stats.sea_level_thrust / (stats.wet_mass * G0).max(1.0);
-    let isp = if stats.vacuum_thrust > 0.0 {
-        effective_isp_weighted / stats.vacuum_thrust
-    } else {
-        0.0
-    };
-    let burnout_mass = stats.wet_mass - stats.liquid_fuel - stats.solid_fuel;
-    if stats.wet_mass > burnout_mass && burnout_mass > 0.0 && isp > 0.0 {
-        stats.vacuum_delta_v = isp * G0 * (stats.wet_mass / burnout_mass).ln();
-    }
+    stats.vacuum_delta_v = staged_vacuum_delta_v(craft, catalog);
     stats
 }
 
@@ -454,6 +525,153 @@ fn drain_liquid_fuel_network(
         }
     }
     taken
+}
+
+fn liquid_fuel_available(vessel: &Vessel, catalog: &PartCatalog, network: &BTreeSet<u64>) -> f64 {
+    vessel
+        .parts
+        .iter()
+        .filter(|part| !part.destroyed && network.contains(&part.instance.instance_id))
+        .filter_map(|part| {
+            let definition = catalog.get(&part.instance.definition_id)?;
+            matches!(definition.module, PartModule::LiquidTank { .. }).then_some(part.fuel)
+        })
+        .sum()
+}
+
+fn burn_vacuum_interval(vessel: &mut Vessel, catalog: &PartCatalog) -> Option<f64> {
+    let mut liquid_networks: BTreeMap<u64, (BTreeSet<u64>, f64, f64)> = BTreeMap::new();
+    let mut solid_burns = Vec::new();
+
+    for part in vessel
+        .parts
+        .iter()
+        .filter(|part| part.active && !part.destroyed)
+    {
+        let Some(definition) = catalog.get(&part.instance.definition_id) else {
+            continue;
+        };
+        match definition.module {
+            PartModule::LiquidEngine {
+                thrust_vac,
+                isp_vac,
+                ..
+            } if thrust_vac > 0.0 && isp_vac > 0.0 => {
+                let network = liquid_fuel_network(vessel, catalog, part.instance.instance_id);
+                let network_id = network
+                    .first()
+                    .copied()
+                    .unwrap_or(part.instance.instance_id);
+                let mass_flow = thrust_vac / (isp_vac * G0);
+                liquid_networks
+                    .entry(network_id)
+                    .and_modify(|(_, thrust, flow)| {
+                        *thrust += thrust_vac;
+                        *flow += mass_flow;
+                    })
+                    .or_insert((network, thrust_vac, mass_flow));
+            }
+            PartModule::SolidEngine { thrust, isp, .. }
+                if part.fuel > f64::EPSILON && thrust > 0.0 && isp > 0.0 =>
+            {
+                solid_burns.push((part.instance.instance_id, thrust, thrust / (isp * G0)));
+            }
+            _ => {}
+        }
+    }
+
+    liquid_networks.retain(|_, (network, _, flow)| {
+        *flow > 0.0 && liquid_fuel_available(vessel, catalog, network) > f64::EPSILON
+    });
+    let total_thrust = liquid_networks
+        .values()
+        .map(|(_, thrust, _)| thrust)
+        .sum::<f64>()
+        + solid_burns.iter().map(|(_, thrust, _)| thrust).sum::<f64>();
+    let total_mass_flow = liquid_networks
+        .values()
+        .map(|(_, _, flow)| flow)
+        .sum::<f64>()
+        + solid_burns.iter().map(|(_, _, flow)| flow).sum::<f64>();
+    if total_thrust <= 0.0 || total_mass_flow <= 0.0 {
+        return None;
+    }
+
+    let mut duration = f64::INFINITY;
+    for (network, _, flow) in liquid_networks.values() {
+        duration = duration.min(liquid_fuel_available(vessel, catalog, network) / flow);
+    }
+    for (id, _, flow) in &solid_burns {
+        if let Some(part) = vessel
+            .parts
+            .iter()
+            .find(|part| part.instance.instance_id == *id)
+        {
+            duration = duration.min(part.fuel / flow);
+        }
+    }
+    if !duration.is_finite() || duration <= 0.0 {
+        return None;
+    }
+
+    let initial_mass = vessel_mass(vessel, catalog);
+    for (network, _, flow) in liquid_networks.values() {
+        drain_liquid_fuel_network(vessel, catalog, network, flow * duration);
+    }
+    for (id, _, flow) in solid_burns {
+        if let Some(part) = vessel
+            .parts
+            .iter_mut()
+            .find(|part| part.instance.instance_id == id)
+        {
+            part.fuel = (part.fuel - flow * duration).max(0.0);
+            if part.fuel <= f64::EPSILON {
+                part.active = false;
+            }
+        }
+    }
+    let final_mass = vessel_mass(vessel, catalog);
+    (initial_mass > final_mass && final_mass > 0.0)
+        .then_some(total_thrust / total_mass_flow * (initial_mass / final_mass).ln())
+}
+
+fn staged_vacuum_delta_v(craft: &CraftBlueprint, catalog: &PartCatalog) -> f64 {
+    let mut vessel = Vessel::from_blueprint(craft, catalog);
+    let has_engine_actions = craft.stages.iter().any(|stage| {
+        stage
+            .actions
+            .iter()
+            .any(|action| matches!(action, StageAction::ActivateEngine(_)))
+    });
+    if !has_engine_actions {
+        for part in &mut vessel.parts {
+            if catalog
+                .get(&part.instance.definition_id)
+                .is_some_and(|definition| {
+                    matches!(
+                        definition.module,
+                        PartModule::LiquidEngine { .. } | PartModule::SolidEngine { .. }
+                    )
+                })
+            {
+                part.active = true;
+            }
+        }
+    }
+
+    let mut delta_v = 0.0;
+    if has_engine_actions {
+        while vessel.next_stage < vessel.stages.len() {
+            activate_next_stage(&mut vessel, catalog);
+            if let Some(interval_delta_v) = burn_vacuum_interval(&mut vessel, catalog) {
+                delta_v += interval_delta_v;
+            }
+        }
+    }
+    while let Some(interval_delta_v) = burn_vacuum_interval(&mut vessel, catalog) {
+        delta_v += interval_delta_v;
+    }
+    delta_v
 }
 
 fn descendants(vessel: &Vessel, root: u64) -> BTreeSet<u64> {
@@ -808,6 +1026,7 @@ pub fn step_vessel(
     let forward = attitude * DVec3::Y;
 
     let mut control_torque = 0.0;
+    let mut rcs_mass_flow = 0.0;
     let (_, _, monopropellant) = resource_totals(vessel, catalog);
     let rcs_available = monopropellant > 1e-6;
     let mut unsafe_chutes = Vec::new();
@@ -825,7 +1044,14 @@ pub fn step_vessel(
         if part_air_speed > 0.1 {
             let part_rotation =
                 attitude * DQuat::from_array(part.instance.local_rotation.map(f64::from));
-            let drag_area = projected_drag_area(def, part_rotation, part_air_direction);
+            let drag_area = projected_drag_area(
+                def,
+                part,
+                vessel,
+                catalog,
+                part_rotation,
+                part_air_direction,
+            );
             let drag_force = -part_air_direction * part_dynamic_pressure * drag_area;
             force += drag_force;
             torque += world_offset.cross(drag_force);
@@ -864,19 +1090,12 @@ pub fn step_vessel(
                     unsafe_chutes.push(part.instance.instance_id);
                 }
             }
-            PartModule::Rcs { thrust } if vessel.controls.rcs && rcs_available => {
-                control_torque += thrust * 2.0
+            PartModule::Rcs { thrust, isp } if vessel.controls.rcs && rcs_available => {
+                control_torque += thrust * 2.0;
+                rcs_mass_flow += thrust / (isp * G0).max(1.0);
             }
             _ => {}
         }
-    }
-    if vessel.controls.rcs
-        && rcs_available
-        && (vessel.controls.pitch.abs() + vessel.controls.yaw.abs() + vessel.controls.roll.abs()
-            > 0.01
-            || vessel.controls.sas.is_some())
-    {
-        drain_monopropellant(vessel, catalog, 0.18 * dt);
     }
     for id in unsafe_chutes {
         if let Some(part) = vessel
@@ -893,10 +1112,15 @@ pub fn step_vessel(
         vessel.controls.roll,
         -vessel.controls.yaw,
     );
-    torque += attitude * local_input * control_torque;
+    let mut applied_control_torque = attitude * local_input * control_torque;
     if vessel.controls.sas.is_some() && local_input.length_squared() < 1e-4 {
-        torque += sas_torque(vessel, attitude, velocity, radial, control_torque);
-        torque -= angular_velocity * control_torque * 0.7;
+        applied_control_torque += sas_torque(vessel, attitude, velocity, radial, control_torque);
+        applied_control_torque -= angular_velocity * control_torque * 0.7;
+    }
+    torque += applied_control_torque;
+    if vessel.controls.rcs && rcs_available && rcs_mass_flow > 0.0 {
+        let effort = (applied_control_torque.length() / control_torque.max(1.0)).clamp(0.0, 1.0);
+        drain_monopropellant(vessel, catalog, rcs_mass_flow * effort * dt);
     }
 
     angular_velocity +=
@@ -1510,7 +1734,7 @@ pub fn update_mission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CraftBlueprint, PartCatalog, PartInstance, Vessel, stock_craft};
+    use crate::model::{CraftBlueprint, PartCatalog, PartInstance, Stage, Vessel, stock_craft};
     use approx::assert_abs_diff_eq;
 
     fn part(id: u64, definition_id: &str, position: [f32; 3]) -> PartInstance {
@@ -1521,6 +1745,120 @@ mod tests {
             local_position: position,
             local_rotation: [0.0, 0.0, 0.0, 1.0],
         }
+    }
+
+    fn child_part(
+        id: u64,
+        definition_id: &str,
+        parent: Option<u64>,
+        position: [f32; 3],
+    ) -> PartInstance {
+        PartInstance {
+            instance_id: id,
+            definition_id: definition_id.into(),
+            parent,
+            local_position: position,
+            local_rotation: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn baseline_solids_have_physical_burn_times_and_stock_liftoff_twr() {
+        let catalog = PartCatalog::default();
+        let expected = [
+            ("solid_stack", 74.0..75.0, 6.6..6.8),
+            ("solid_radial", 69.0..70.0, 7.5..7.7),
+        ];
+        for (id, burn_range, mass_ratio_range) in expected {
+            let definition = catalog.get(id).unwrap();
+            let PartModule::SolidEngine {
+                thrust, isp, fuel, ..
+            } = definition.module
+            else {
+                panic!("{id} is not a solid engine")
+            };
+            let burn_time = fuel * isp * G0 / thrust;
+            let wet_to_dry = (definition.dry_mass + fuel) / definition.dry_mass;
+            assert!(burn_range.contains(&burn_time), "{id}: {burn_time}");
+            assert!(mass_ratio_range.contains(&wet_to_dry), "{id}: {wet_to_dry}");
+        }
+
+        let stats = craft_stats(&stock_craft(), &catalog);
+        assert!(
+            (2.1..=2.2).contains(&stats.sea_level_twr),
+            "stock liftoff TWR was {}",
+            stats.sea_level_twr
+        );
+    }
+
+    #[test]
+    fn craft_stats_model_parallel_engines_and_connected_tank_crossfeed() {
+        let catalog = PartCatalog::default();
+        let parallel = CraftBlueprint {
+            schema_version: 1,
+            name: "Parallel engines".into(),
+            parts: vec![
+                child_part(1, "tank_long", None, [0.0, 1.0, 0.0]),
+                child_part(2, "engine_sl_s", Some(1), [-0.5, -1.0, 0.0]),
+                child_part(3, "engine_sl_s", Some(1), [0.5, -1.0, 0.0]),
+            ],
+            stages: vec![Stage {
+                name: "Ignition".into(),
+                actions: vec![
+                    StageAction::ActivateEngine(2),
+                    StageAction::ActivateEngine(3),
+                ],
+            }],
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let parallel_stats = craft_stats(&parallel, &catalog);
+        let PartModule::LiquidEngine {
+            thrust_vac,
+            isp_vac,
+            ..
+        } = catalog.get("engine_sl_s").unwrap().module
+        else {
+            unreachable!()
+        };
+        let parallel_dry = catalog.get("tank_long").unwrap().dry_mass
+            + 2.0 * catalog.get("engine_sl_s").unwrap().dry_mass;
+        let parallel_expected =
+            isp_vac * G0 * ((parallel_dry + parallel_stats.liquid_fuel) / parallel_dry).ln();
+        assert_abs_diff_eq!(
+            parallel_stats.vacuum_thrust,
+            2.0 * thrust_vac,
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(
+            parallel_stats.vacuum_delta_v,
+            parallel_expected,
+            epsilon = 1e-9
+        );
+
+        let crossfeed = CraftBlueprint {
+            schema_version: 1,
+            name: "Connected tanks".into(),
+            parts: vec![
+                child_part(1, "tank_long", None, [0.0, 2.0, 0.0]),
+                child_part(2, "tank_short", Some(1), [0.0, -1.0, 0.0]),
+                child_part(3, "engine_sl_s", Some(2), [0.0, -3.0, 0.0]),
+            ],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let crossfeed_stats = craft_stats(&crossfeed, &catalog);
+        let crossfeed_dry = catalog.get("tank_long").unwrap().dry_mass
+            + catalog.get("tank_short").unwrap().dry_mass
+            + catalog.get("engine_sl_s").unwrap().dry_mass;
+        let crossfeed_expected =
+            isp_vac * G0 * ((crossfeed_dry + crossfeed_stats.liquid_fuel) / crossfeed_dry).ln();
+        assert_abs_diff_eq!(
+            crossfeed_stats.vacuum_delta_v,
+            crossfeed_expected,
+            epsilon = 1e-9
+        );
     }
 
     #[test]
@@ -1972,12 +2310,117 @@ mod tests {
         ];
         vessel.velocity = [0.0; 3];
         let initial_mass = vessel_mass(&vessel, &catalog);
-        let burn = 180_000.0 / (245.0 * G0);
-        let expected_delta_v = 180_000.0 / (initial_mass - burn * 0.5);
+        let PartModule::SolidEngine { thrust, isp, .. } =
+            catalog.get("solid_stack").unwrap().module
+        else {
+            unreachable!()
+        };
+        let burn = thrust / (isp * G0);
+        let expected_delta_v = thrust / (initial_mass - burn * 0.5);
 
         step_vessel(&mut vessel, &catalog, 1.0, 0.0);
 
         assert_abs_diff_eq!(vessel.velocity[1], expected_delta_v, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn rcs_consumption_scales_with_clusters_and_control_effort() {
+        let catalog = PartCatalog::default();
+        let make_vessel = |clusters: u64, pitch: f64| {
+            let mut parts = vec![child_part(1, "mono_tank", None, [0.0, 0.0, 0.0])];
+            for id in 2..clusters + 2 {
+                parts.push(child_part(id, "rcs", Some(1), [0.0, 0.0, 0.0]));
+            }
+            let craft = CraftBlueprint {
+                schema_version: 1,
+                name: "RCS test".into(),
+                parts,
+                stages: Vec::new(),
+                crew: Vec::new(),
+                script_name: None,
+            };
+            let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+            vessel.position = [
+                crate::model::HOME_RADIUS + HOME_ATMOSPHERE + 1_000.0,
+                0.0,
+                0.0,
+            ];
+            vessel.velocity = [0.0; 3];
+            vessel.controls.sas = None;
+            vessel.controls.rcs = true;
+            vessel.controls.pitch = pitch;
+            vessel
+        };
+        let PartModule::Rcs { thrust, isp } = catalog.get("rcs").unwrap().module else {
+            unreachable!()
+        };
+        let cluster_flow = thrust / (isp * G0);
+
+        let mut one = make_vessel(1, 1.0);
+        let one_before = one.parts[0].fuel;
+        step_vessel(&mut one, &catalog, 1.0, 0.0);
+        let one_used = one_before - one.parts[0].fuel;
+        assert_abs_diff_eq!(one_used, cluster_flow, epsilon = 1e-12);
+
+        let mut two = make_vessel(2, 1.0);
+        let two_before = two.parts[0].fuel;
+        step_vessel(&mut two, &catalog, 1.0, 0.0);
+        let two_used = two_before - two.parts[0].fuel;
+        assert_abs_diff_eq!(two_used, 2.0 * cluster_flow, epsilon = 1e-12);
+        assert!(two.angular_velocity_vec().length() > one.angular_velocity_vec().length());
+
+        let mut quarter = make_vessel(1, 0.25);
+        let quarter_before = quarter.parts[0].fuel;
+        step_vessel(&mut quarter, &catalog, 1.0, 0.0);
+        assert_abs_diff_eq!(
+            quarter_before - quarter.parts[0].fuel,
+            cluster_flow * 0.25,
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn rcs_uses_no_propellant_without_demand_and_stops_at_exhaustion() {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "RCS exhaustion".into(),
+            parts: vec![
+                child_part(1, "mono_tank", None, [0.0, 0.0, 0.0]),
+                child_part(2, "rcs", Some(1), [0.0, 0.0, 0.0]),
+            ],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        vessel.position = [
+            crate::model::HOME_RADIUS + HOME_ATMOSPHERE + 1_000.0,
+            0.0,
+            0.0,
+        ];
+        vessel.velocity = [0.0; 3];
+        vessel.controls.sas = None;
+        vessel.controls.rcs = true;
+        let initial = vessel.parts[0].fuel;
+        step_vessel(&mut vessel, &catalog, 1.0, 0.0);
+        assert_abs_diff_eq!(vessel.parts[0].fuel, initial, epsilon = 1e-12);
+
+        let mut exhausted = Vessel::from_blueprint(&craft, &catalog);
+        exhausted.position = [
+            crate::model::HOME_RADIUS + HOME_ATMOSPHERE + 1_000.0,
+            0.0,
+            0.0,
+        ];
+        exhausted.velocity = [0.0; 3];
+        exhausted.controls.sas = None;
+        exhausted.controls.rcs = true;
+        exhausted.controls.pitch = 1.0;
+        exhausted.parts[0].fuel = 0.01;
+        step_vessel(&mut exhausted, &catalog, 1.0, 1.0);
+        assert_eq!(exhausted.parts[0].fuel, 0.0);
+        step_vessel(&mut exhausted, &catalog, 1.0, 2.0);
+        assert_eq!(exhausted.parts[0].fuel, 0.0);
     }
 
     #[test]
@@ -2167,11 +2610,112 @@ mod tests {
     #[test]
     fn projected_drag_distinguishes_nose_first_and_broadside() {
         let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Drag test".into(),
+            parts: vec![part(1, "tank_long", [0.0, 0.0, 0.0])],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let vessel = Vessel::from_blueprint(&craft, &catalog);
         let tank = catalog.get("tank_long").unwrap();
-        let nose_first = projected_drag_area(tank, DQuat::IDENTITY, DVec3::Y);
-        let broadside = projected_drag_area(tank, DQuat::IDENTITY, DVec3::X);
+        let runtime = &vessel.parts[0];
+        let nose_first =
+            projected_drag_area(tank, runtime, &vessel, &catalog, DQuat::IDENTITY, DVec3::Y);
+        let broadside =
+            projected_drag_area(tank, runtime, &vessel, &catalog, DQuat::IDENTITY, DVec3::X);
 
         assert!(broadside > nose_first * 2.0);
+    }
+
+    #[test]
+    fn inline_drag_shields_only_the_covered_axial_face() {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Inline shielding".into(),
+            parts: vec![
+                child_part(1, "tank_long", None, [0.0, 0.0, 0.0]),
+                child_part(2, "tank_short", Some(1), [0.0, 4.2, 0.0]),
+                child_part(3, "rcs", Some(1), [1.5, 0.0, 0.0]),
+            ],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        let tank_definition = catalog.get("tank_long").unwrap();
+        let rcs_definition = catalog.get("rcs").unwrap();
+        let isolated = CraftBlueprint {
+            parts: vec![child_part(1, "tank_long", None, [0.0, 0.0, 0.0])],
+            ..craft.clone()
+        };
+        let isolated_vessel = Vessel::from_blueprint(&isolated, &catalog);
+
+        let isolated_axial = projected_drag_area(
+            tank_definition,
+            &isolated_vessel.parts[0],
+            &isolated_vessel,
+            &catalog,
+            DQuat::IDENTITY,
+            DVec3::Y,
+        );
+        let shielded_axial = projected_drag_area(
+            tank_definition,
+            &vessel.parts[0],
+            &vessel,
+            &catalog,
+            DQuat::IDENTITY,
+            DVec3::Y,
+        );
+        assert!(shielded_axial < isolated_axial * 1e-9);
+
+        let isolated_broadside = projected_drag_area(
+            tank_definition,
+            &isolated_vessel.parts[0],
+            &isolated_vessel,
+            &catalog,
+            DQuat::IDENTITY,
+            DVec3::X,
+        );
+        let shielded_broadside = projected_drag_area(
+            tank_definition,
+            &vessel.parts[0],
+            &vessel,
+            &catalog,
+            DQuat::IDENTITY,
+            DVec3::X,
+        );
+        assert_abs_diff_eq!(isolated_broadside, shielded_broadside, epsilon = 1e-12);
+
+        let radial_before = projected_drag_area(
+            rcs_definition,
+            &vessel.parts[2],
+            &vessel,
+            &catalog,
+            DQuat::IDENTITY,
+            DVec3::Y,
+        );
+        vessel.parts[1].destroyed = true;
+        let reexposed_axial = projected_drag_area(
+            tank_definition,
+            &vessel.parts[0],
+            &vessel,
+            &catalog,
+            DQuat::IDENTITY,
+            DVec3::Y,
+        );
+        let radial_after = projected_drag_area(
+            rcs_definition,
+            &vessel.parts[2],
+            &vessel,
+            &catalog,
+            DQuat::IDENTITY,
+            DVec3::Y,
+        );
+        assert_abs_diff_eq!(reexposed_axial, isolated_axial, epsilon = 1e-12);
+        assert_abs_diff_eq!(radial_before, radial_after, epsilon = 1e-12);
     }
 
     #[test]

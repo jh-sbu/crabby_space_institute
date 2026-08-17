@@ -9,7 +9,16 @@ use crate::model::SasMode;
 use crate::simulation::FlightTelemetry;
 
 pub const EXAMPLE_SCRIPT: &str = r#"-- Crabby Space Institute: orbit insertion (callback style)
-state = state or { phase = 0, boosters_dropped = false }
+state = state or { phase = 0, boosters_dropped = false, throttle = 1.0 }
+
+local function regulate_twr(target)
+  state.throttle = state.throttle or 1.0
+  local current = resources.twr()
+  if current > 0.1 then
+    state.throttle = math.max(0.2, math.min(1.0, state.throttle * target / current))
+    control.set_throttle(state.throttle)
+  end
+end
 
 function on_start()
   control.set_throttle(1.0)
@@ -18,8 +27,19 @@ function on_start()
   log.info("Ignition. Beginning automated gravity turn.")
 end
 
+function on_restore(restored)
+  state.throttle = state.throttle or 1.0
+end
+
 function on_fixed_update(dt)
-  if not state.boosters_dropped and resources.solid_fuel() < 5 then
+  state.throttle = state.throttle or 1.0
+  if state.phase < 3 then
+    regulate_twr(3.2)
+  elseif state.phase == 4 then
+    regulate_twr(3.0)
+  end
+
+  if not state.boosters_dropped and (resources.solid_fuel() < 5 or flight.apoapsis() > 90000) then
     control.stage()
     state.boosters_dropped = true
     log.info("Radial boosters clear")
@@ -27,19 +47,20 @@ function on_fixed_update(dt)
 
   if state.phase == 0 and flight.altitude() > 1200 then
     control.set_sas("off")
-    control.set_rotation(0.075, 0.0, 0.0)
+    control.set_rotation(0.15, 0.0, 0.0)
     state.phase = 1
-  elseif state.phase == 1 and flight.altitude() > 9000 then
+  elseif state.phase == 1 and flight.altitude() > 7000 then
     control.set_rotation(0.0, 0.0, 0.0)
     control.set_sas("prograde")
     state.phase = 2
-  elseif state.phase == 2 and flight.apoapsis() > 90000 then
+  elseif state.phase == 2 and state.boosters_dropped and flight.apoapsis() > 90000 then
     control.set_throttle(0.0)
     state.phase = 3
     log.info("Coasting to apoapsis")
   elseif state.phase == 3 and flight.altitude() > 70000 and flight.vertical_speed() < 120 then
     control.stage()
     control.set_sas("prograde")
+    state.throttle = 1.0
     control.set_throttle(1.0)
     state.phase = 4
     log.info("Upper-stage circularization burn")
@@ -61,13 +82,13 @@ function main()
   control.stage()
   wait.until_condition(function() return flight.altitude() > 1200 end)
   control.set_sas("off")
-  control.set_rotation(0.075, 0.0, 0.0)
-  wait.until_condition(function() return flight.altitude() > 9000 end)
+  control.set_rotation(0.15, 0.0, 0.0)
+  wait.until_condition(function() return flight.altitude() > 7000 end)
   control.set_rotation(0.0, 0.0, 0.0)
   control.set_sas("prograde")
-  wait.until_condition(function() return resources.solid_fuel() < 5 end)
+  wait.until_condition(function() return resources.solid_fuel() < 5 or flight.apoapsis() > 90000 end)
   control.stage()
-  wait.until_condition(function() return flight.apoapsis() > 80000 end)
+  wait.until_condition(function() return flight.apoapsis() > 90000 end)
   control.set_throttle(0.0)
   log.info("Target apoapsis reached")
 end
@@ -483,7 +504,9 @@ impl ScriptRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{HOME_ATMOSPHERE, PartCatalog, Vessel, stock_craft};
     use crate::orbit::OrbitalElements;
+    use crate::simulation::{activate_next_stage, step_vessel, telemetry as flight_telemetry};
 
     fn telemetry(altitude: f64) -> FlightTelemetry {
         FlightTelemetry {
@@ -545,5 +568,99 @@ mod tests {
         runtime.load(source.into(), state).unwrap();
         runtime.tick(&telemetry(0.0));
         assert_eq!(runtime.snapshot_state().unwrap()["phase"], 2);
+    }
+
+    #[test]
+    fn default_guidance_reaches_a_balanced_orbit_at_sixty_hertz() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let mut runtime = ScriptRuntime::default();
+        runtime.load(EXAMPLE_SCRIPT.into(), None).unwrap();
+
+        let dt = 1.0 / 60.0;
+        let mut ut = 0.0;
+        let mut current = flight_telemetry(&vessel, &catalog, ut, 0.0);
+        let mut booster_separation = None;
+        let mut core_fuel_at_separation = None;
+        let mut orbit_time = None;
+        let mut max_twr = 0.0_f64;
+        let mut max_dynamic_pressure = 0.0_f64;
+
+        for _ in 0..(300 * 60) {
+            let before = flight_telemetry(&vessel, &catalog, ut, current.thrust);
+            let commands = runtime.tick(&before);
+            if let Some(value) = commands.throttle {
+                vessel.controls.throttle = value;
+            }
+            if let Some(value) = commands.pitch {
+                vessel.controls.pitch = value;
+            }
+            if let Some(value) = commands.yaw {
+                vessel.controls.yaw = value;
+            }
+            if let Some(value) = commands.roll {
+                vessel.controls.roll = value;
+            }
+            if let Some(value) = commands.sas {
+                vessel.controls.sas = value;
+            }
+            if let Some(value) = commands.rcs {
+                vessel.controls.rcs = value;
+            }
+            if commands.stage {
+                let prior_stage = vessel.next_stage;
+                activate_next_stage(&mut vessel, &catalog);
+                if prior_stage == 1 && vessel.next_stage == 2 {
+                    booster_separation = Some(ut);
+                    core_fuel_at_separation = vessel
+                        .parts
+                        .iter()
+                        .find(|part| part.instance.instance_id == 8)
+                        .map(|part| part.fuel);
+                }
+            }
+
+            current = step_vessel(&mut vessel, &catalog, dt, ut);
+            ut += dt;
+            max_twr = max_twr.max(current.twr);
+            max_dynamic_pressure = max_dynamic_pressure.max(current.dynamic_pressure);
+            if current.orbit.periapsis >= 75_000.0 {
+                orbit_time.get_or_insert(ut);
+            }
+            if current.orbit.periapsis > 76_000.0 && vessel.controls.throttle == 0.0 {
+                break;
+            }
+        }
+
+        assert!(runtime.active, "guidance failed: {:?}", runtime.last_error);
+        let separation = booster_separation.expect("boosters never separated");
+        assert!(
+            (65.0..=72.0).contains(&separation),
+            "separated at {separation}"
+        );
+        assert!(
+            core_fuel_at_separation.is_some_and(|fuel| fuel > 1_000.0),
+            "core tank was empty at booster separation: {core_fuel_at_separation:?}"
+        );
+        assert!(max_twr <= 3.3, "maximum TWR was {max_twr}");
+        assert!(
+            (35_000.0..=55_000.0).contains(&max_dynamic_pressure),
+            "maximum dynamic pressure was {max_dynamic_pressure} Pa"
+        );
+        let orbit_time = orbit_time.expect("guidance did not reach orbit");
+        assert!(orbit_time < 300.0, "orbit took {orbit_time} seconds");
+        assert!(current.orbit.periapsis >= 75_000.0);
+        assert!(
+            current.orbit.apoapsis <= 120_000.0,
+            "apoapsis was {}",
+            current.orbit.apoapsis
+        );
+        let upper_fuel = vessel
+            .parts
+            .iter()
+            .find(|part| part.instance.instance_id == 4)
+            .map_or(0.0, |part| part.fuel);
+        assert!(upper_fuel > 0.0, "upper stage exhausted its tank");
+        assert!(current.altitude > HOME_ATMOSPHERE);
     }
 }
