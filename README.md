@@ -82,6 +82,22 @@ An optional, local-only MCP server can inspect and mutate live game state for de
 cargo run --features mcp
 ```
 
-While that build is running, connect an MCP client to `http://127.0.0.1:8765/mcp`. The server exposes `inspect_game_state` and `patch_game_state`; patches use JSON Merge Patch semantics and are applied atomically on Bevy's update loop. Set `CRABBY_MCP_ADDR` to choose another loopback address. The server refuses non-loopback binds.
+While that build is running, connect an MCP client to `http://127.0.0.1:8765/mcp`. Set `CRABBY_MCP_ADDR` to choose another loopback address. The server refuses non-loopback binds.
+
+The MCP exposes two complementary debugging surfaces:
+
+- `inspect_game_state` and `patch_game_state` inspect or atomically merge-patch simulation state. Read before patching, patch only intended fields, and pause the clock before editing coupled flight values.
+- `inspect_player_state` plus `menu_action`, `assembly_action`, `set_flight_controls`, `flight_action`, `script_action`, and `view_action` drive the same validation and gameplay paths as player input. Use these semantic actions for normal live testing.
+
+For example, this sequence enters Vehicle Assembly, launches the stock craft through normal validation, and produces a physics-driven liftoff:
+
+```json
+{"tool":"menu_action","arguments":{"action":"open_vehicle_assembly"}}
+{"tool":"assembly_action","arguments":{"action":"launch"}}
+{"tool":"set_flight_controls","arguments":{"throttle":1.0}}
+{"tool":"flight_action","arguments":{"action":"activate_next_stage"}}
+```
+
+Supplied MCP pitch, yaw, and roll axes remain latched across frames so a client can emulate held flight keys. Call `flight_action` with `{"action":"release_attitude_controls"}` to release all three axes back to the physical keyboard. Throttle remains set, matching the player's latched throttle control. Action tools reject invalid modes, identifiers, and ranges without bypassing gameplay validation. `Quit` is intentionally not exposed because it would sever the debugging connection.
 
 The MCP code and its networking dependencies are excluded unless the `mcp` feature is enabled.

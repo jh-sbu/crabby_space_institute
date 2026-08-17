@@ -99,6 +99,13 @@ struct ViewState {
     script_log: Vec<String>,
 }
 
+#[derive(Resource, Default)]
+struct RemoteFlightInput {
+    pitch: Option<f64>,
+    yaw: Option<f64>,
+    roll: Option<f64>,
+}
+
 #[derive(Component)]
 struct MainCamera;
 #[derive(Component)]
@@ -132,6 +139,7 @@ pub fn run() {
     .init_resource::<Session>()
     .init_resource::<EditorState>()
     .init_resource::<ViewState>()
+    .init_resource::<RemoteFlightInput>()
     .init_resource::<SimulationClock>()
     .init_resource::<ScriptRuntime>()
     .init_state::<AppMode>()
@@ -533,6 +541,7 @@ fn flight_input(
     mut clock: ResMut<SimulationClock>,
     mut runtime: ResMut<ScriptRuntime>,
     mut view: ResMut<ViewState>,
+    remote_input: Res<RemoteFlightInput>,
 ) {
     if *state.get() != AppMode::Flight || wants_input.wants_keyboard_input() {
         return;
@@ -550,9 +559,15 @@ fn flight_input(
     let axis = |negative: KeyCode, positive: KeyCode| {
         keys.pressed(positive) as i8 as f64 - keys.pressed(negative) as i8 as f64
     };
-    vessel.controls.pitch = axis(KeyCode::KeyS, KeyCode::KeyW);
-    vessel.controls.yaw = axis(KeyCode::KeyD, KeyCode::KeyA);
-    vessel.controls.roll = axis(KeyCode::KeyE, KeyCode::KeyQ);
+    vessel.controls.pitch = remote_input
+        .pitch
+        .unwrap_or_else(|| axis(KeyCode::KeyS, KeyCode::KeyW));
+    vessel.controls.yaw = remote_input
+        .yaw
+        .unwrap_or_else(|| axis(KeyCode::KeyD, KeyCode::KeyA));
+    vessel.controls.roll = remote_input
+        .roll
+        .unwrap_or_else(|| axis(KeyCode::KeyE, KeyCode::KeyQ));
     let throttle_delta =
         axis(KeyCode::ControlLeft, KeyCode::ShiftLeft) * time.delta_secs_f64() * 0.45;
     if throttle_delta != 0.0 {
@@ -564,9 +579,8 @@ fn flight_input(
     if keys.just_pressed(KeyCode::KeyX) {
         vessel.controls.throttle = 0.0;
     }
-    if keys.just_pressed(KeyCode::Space) && activate_next_stage(vessel, &catalog.0) {
-        *visual_dirty = true;
-        runtime.emit_event("stage");
+    if keys.just_pressed(KeyCode::Space) {
+        activate_stage(vessel, &catalog.0, visual_dirty, &mut runtime);
     }
     if keys.just_pressed(KeyCode::KeyT) {
         vessel.controls.sas = if vessel.controls.sas.is_some() {
@@ -594,18 +608,8 @@ fn flight_input(
         runtime.stop();
     }
     if keys.just_pressed(KeyCode::F5) {
-        let save = QuickSave {
-            schema_version: SAVE_SCHEMA,
-            vessel: vessel.clone(),
-            clock: clock.clone(),
-            mission: mission.clone(),
-            script_source: runtime.source.clone(),
-            script_state: runtime.snapshot_state(),
-        };
-        *notice = match store.0.save_quick(&save) {
-            Ok(()) => "Quicksave written".into(),
-            Err(error) => format!("Save failed: {error}"),
-        };
+        *notice = save_quicksave(vessel, mission, &clock, &runtime, &store.0)
+            .unwrap_or_else(|error| error);
     }
     if keys.just_pressed(KeyCode::F9) {
         match store.0.load_quick() {
@@ -620,6 +624,41 @@ fn flight_input(
             Err(error) => *notice = format!("Load failed: {error}"),
         }
     }
+}
+
+fn activate_stage(
+    vessel: &mut Vessel,
+    catalog: &PartCatalog,
+    visual_dirty: &mut bool,
+    runtime: &mut ScriptRuntime,
+) -> bool {
+    if !activate_next_stage(vessel, catalog) {
+        return false;
+    }
+    *visual_dirty = true;
+    runtime.emit_event("stage");
+    true
+}
+
+fn save_quicksave(
+    vessel: &Vessel,
+    mission: &MissionProgress,
+    clock: &SimulationClock,
+    runtime: &ScriptRuntime,
+    store: &SaveStore,
+) -> Result<String, String> {
+    let save = QuickSave {
+        schema_version: SAVE_SCHEMA,
+        vessel: vessel.clone(),
+        clock: clock.clone(),
+        mission: mission.clone(),
+        script_source: runtime.source.clone(),
+        script_state: runtime.snapshot_state(),
+    };
+    store
+        .save_quick(&save)
+        .map(|()| "Quicksave written".into())
+        .map_err(|error| format!("Save failed: {error}"))
 }
 
 fn simulate_flight(
@@ -928,26 +967,10 @@ fn menu_ui(
             ui.label(egui::RichText::new("Per aspera ad astacum").italics().color(egui::Color32::from_rgb(227, 158, 96)));
             ui.add_space(30.0);
             if ui.add_sized([260.0, 42.0], egui::Button::new("Vehicle Assembly")).clicked() {
-                session.craft = stock_craft();
-                session.vessel = None;
-                session.visual_dirty = true;
-                session.notice = "Stock Pathfinder loaded. Modify it or launch as-is.".into();
-                runtime.source = EXAMPLE_SCRIPT.into();
-                next_state.set(AppMode::Editor);
+                enter_vehicle_assembly(session, runtime, next_state);
             }
             if store.quicksave_exists() && ui.add_sized([260.0, 42.0], egui::Button::new("Continue Quicksave")).clicked() {
-                match store.load_quick() {
-                    Ok(save) => {
-                        session.vessel = Some(save.vessel);
-                        session.mission = save.mission;
-                        *clock = save.clock;
-                        if let Err(error) = runtime.load(save.script_source, save.script_state) { session.notice = format!("Flight loaded; script paused: {error}"); }
-                        session.visual_dirty = true;
-                        view.map = false;
-                        next_state.set(AppMode::Flight);
-                    }
-                    Err(error) => session.notice = format!("Could not load quicksave: {error}"),
-                }
+                let _ = continue_quicksave(session, store, clock, runtime, view, next_state);
             }
             if ui.add_sized([260.0, 42.0], egui::Button::new("Quit")).clicked() { app_exit.write(AppExit::Success); }
             ui.add_space(24.0);
@@ -955,6 +978,45 @@ fn menu_ui(
             ui.label(egui::RichText::new(&session.notice).color(egui::Color32::LIGHT_BLUE));
         });
     });
+}
+
+fn enter_vehicle_assembly(
+    session: &mut Session,
+    runtime: &mut ScriptRuntime,
+    next_state: &mut NextState<AppMode>,
+) {
+    session.craft = stock_craft();
+    session.vessel = None;
+    session.visual_dirty = true;
+    session.notice = "Stock Pathfinder loaded. Modify it or launch as-is.".into();
+    runtime.source = EXAMPLE_SCRIPT.into();
+    next_state.set(AppMode::Editor);
+}
+
+fn continue_quicksave(
+    session: &mut Session,
+    store: &SaveStore,
+    clock: &mut SimulationClock,
+    runtime: &mut ScriptRuntime,
+    view: &mut ViewState,
+    next_state: &mut NextState<AppMode>,
+) -> Result<(), String> {
+    let save = store.load_quick().map_err(|error| {
+        let message = format!("Could not load quicksave: {error}");
+        session.notice.clone_from(&message);
+        message
+    })?;
+    session.vessel = Some(save.vessel);
+    session.mission = save.mission;
+    *clock = save.clock;
+    session.notice = match runtime.load(save.script_source, save.script_state) {
+        Ok(()) => "Quicksave restored".into(),
+        Err(error) => format!("Flight loaded; script paused: {error}"),
+    };
+    session.visual_dirty = true;
+    view.map = false;
+    next_state.set(AppMode::Flight);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1273,9 +1335,7 @@ fn flight_ui(
     egui::Panel::top("flight_top").show(viewport_ui, |ui| {
         ui.horizontal(|ui| {
             if ui.button("Assembly").clicked() {
-                runtime.stop();
-                session.visual_dirty = true;
-                next_state.set(AppMode::Editor);
+                return_to_assembly(session, runtime, next_state);
             }
             if ui.selectable_label(view.map, "Map [M]").clicked() {
                 view.map = !view.map;
@@ -1303,18 +1363,8 @@ fn flight_ui(
             if ui.button("F5 Save").clicked()
                 && let Some(vessel) = &session.vessel
             {
-                let save = QuickSave {
-                    schema_version: SAVE_SCHEMA,
-                    vessel: vessel.clone(),
-                    clock: clock.clone(),
-                    mission: session.mission.clone(),
-                    script_source: runtime.source.clone(),
-                    script_state: runtime.snapshot_state(),
-                };
-                session.notice = match store.save_quick(&save) {
-                    Ok(()) => "Quicksave written".into(),
-                    Err(error) => format!("Save failed: {error}"),
-                };
+                session.notice = save_quicksave(vessel, &session.mission, clock, runtime, store)
+                    .unwrap_or_else(|error| error);
             }
             if ui.button("F9 Load").clicked() {
                 load_quicksave(session, store, clock, runtime);
@@ -1375,10 +1425,8 @@ fn flight_ui(
             .default_size(260.0)
             .show(viewport_ui, |ui| {
                 ui.heading("Flight plan");
-                if ui.button("ACTIVATE NEXT STAGE [Space]").clicked()
-                    && activate_next_stage(vessel, catalog)
-                {
-                    session.visual_dirty = true;
+                if ui.button("ACTIVATE NEXT STAGE [Space]").clicked() {
+                    activate_stage(vessel, catalog, &mut session.visual_dirty, runtime);
                 }
                 if let Some(stage) = vessel.stages.get(vessel.next_stage) {
                     ui.small(format!("Next: {}", stage.name));
@@ -1437,6 +1485,16 @@ fn flight_ui(
     if view.show_help {
         help_window(ctx);
     }
+}
+
+fn return_to_assembly(
+    session: &mut Session,
+    runtime: &mut ScriptRuntime,
+    next_state: &mut NextState<AppMode>,
+) {
+    runtime.stop();
+    session.visual_dirty = true;
+    next_state.set(AppMode::Editor);
 }
 
 fn maneuver_window(ctx: &egui::Context, session: &mut Session, clock: &SimulationClock) {
