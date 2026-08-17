@@ -14,6 +14,7 @@ use crate::orbit::{
 };
 
 const G0: f64 = 9.80665;
+const ON_RAILS_CLEARANCE: f64 = 5_000.0;
 
 fn aerodynamic_lift_force(
     forward: DVec3,
@@ -591,16 +592,152 @@ pub fn step_vessel(
 }
 
 pub fn step_on_rails(vessel: &mut Vessel, dt: f64) {
+    if matches!(vessel.situation, FlightSituation::Crashed) {
+        return;
+    }
     let body = body_definition(&vessel.primary_body);
+    let surface_encountered =
+        trajectory_reaches_surface(vessel.position_vec(), vessel.velocity_vec(), &body, dt);
     let (position, velocity) =
         propagate_universal(vessel.position_vec(), vessel.velocity_vec(), body.mu, dt);
     vessel.position = position.to_array();
     vessel.velocity = velocity.to_array();
+    update_on_rails_situation(vessel, surface_encountered);
 }
 
 pub fn step_on_rails_patched(vessel: &mut Vessel, ut: f64, dt: f64) {
+    let previous_body = vessel.primary_body.clone();
     step_on_rails(vessel, dt);
+    if matches!(vessel.situation, FlightSituation::Crashed) {
+        return;
+    }
     apply_soi_transitions(vessel, ut + dt);
+    // A patched-conic transition changes both the body's surface/atmosphere and
+    // the osculating orbit, so the old situation cannot be carried across it.
+    let new_body = body_definition(&vessel.primary_body);
+    let captured = new_body.parent == Some(previous_body.as_str());
+    let orbit = elements(
+        vessel.position_vec(),
+        vessel.velocity_vec(),
+        new_body.mu,
+        new_body.radius,
+    );
+    // Entering a child's SOI inbound and emerging outbound in one rails frame
+    // means periapsis also occurred in that frame. Do not let a body impact be
+    // skipped merely because both endpoints happened to be above the terrain.
+    let crossed_surface_during_capture = captured
+        && vessel.position_vec().dot(vessel.velocity_vec()) > 0.0
+        && orbit.periapsis <= 5.0;
+    update_on_rails_situation(vessel, crossed_surface_during_capture);
+}
+
+/// Whether the vessel can safely take another analytic high-warp step.
+///
+/// Checking only the current altitude is insufficient: a single high-warp
+/// frame can span an entire descent from space to below the surface. Bound
+/// trajectories with a low periapsis, and inbound escape trajectories, must
+/// return to the fixed-step simulation before that can happen.
+pub fn on_rails_warp_is_safe(vessel: &Vessel) -> bool {
+    if !matches!(vessel.situation, FlightSituation::Orbiting) {
+        return false;
+    }
+
+    let body = body_definition(&vessel.primary_body);
+    let position = vessel.position_vec();
+    let velocity = vessel.velocity_vec();
+    let atmosphere_height = body
+        .atmosphere
+        .as_ref()
+        .map_or(0.0, |atmosphere| atmosphere.height);
+    let minimum_altitude = atmosphere_height + ON_RAILS_CLEARANCE;
+    let altitude = position.length() - body.radius;
+    if altitude < minimum_altitude {
+        return false;
+    }
+
+    let orbit = elements(position, velocity, body.mu, body.radius);
+    let will_revisit_periapsis = orbit.period.is_some() || position.dot(velocity) < 0.0;
+    !will_revisit_periapsis || orbit.periapsis >= minimum_altitude
+}
+
+fn time_until_periapsis(position: DVec3, velocity: DVec3, mu: f64) -> Option<f64> {
+    let orbit = elements(position, velocity, mu, 0.0);
+    if orbit.eccentricity <= 1e-12 {
+        return None;
+    }
+
+    if orbit.specific_energy < 0.0 {
+        let semi_major_axis = orbit.semi_major_axis;
+        let cos_eccentric_anomaly =
+            ((1.0 - position.length() / semi_major_axis) / orbit.eccentricity).clamp(-1.0, 1.0);
+        let sin_eccentric_anomaly =
+            position.dot(velocity) / (orbit.eccentricity * (mu * semi_major_axis).sqrt());
+        let eccentric_anomaly = sin_eccentric_anomaly
+            .atan2(cos_eccentric_anomaly)
+            .rem_euclid(TAU);
+        let mean_anomaly =
+            (eccentric_anomaly - orbit.eccentricity * sin_eccentric_anomaly).rem_euclid(TAU);
+        let mean_motion = (mu / semi_major_axis.powi(3)).sqrt();
+        Some((TAU - mean_anomaly) / mean_motion)
+    } else if position.dot(velocity) < 0.0 && orbit.semi_major_axis.is_finite() {
+        let semi_major_axis = -orbit.semi_major_axis;
+        let sinh_hyperbolic_anomaly =
+            position.dot(velocity) / (orbit.eccentricity * (mu * semi_major_axis).sqrt());
+        let hyperbolic_anomaly = sinh_hyperbolic_anomaly.asinh();
+        let mean_anomaly = orbit.eccentricity * sinh_hyperbolic_anomaly - hyperbolic_anomaly;
+        let mean_motion = (mu / semi_major_axis.powi(3)).sqrt();
+        Some(-mean_anomaly / mean_motion)
+    } else {
+        None
+    }
+}
+
+fn trajectory_reaches_surface(
+    position: DVec3,
+    velocity: DVec3,
+    body: &CelestialBodyDef,
+    dt: f64,
+) -> bool {
+    if position.length() <= body.radius + 5.0 {
+        return true;
+    }
+
+    let orbit = elements(position, velocity, body.mu, body.radius);
+    if orbit.periapsis > 5.0 {
+        return false;
+    }
+
+    time_until_periapsis(position, velocity, body.mu).is_some_and(|time| time <= dt)
+}
+
+fn update_on_rails_situation(vessel: &mut Vessel, surface_encountered: bool) {
+    let body = body_definition(&vessel.primary_body);
+    let mut position = vessel.position_vec();
+    let altitude = position.length() - body.radius;
+
+    if surface_encountered || altitude <= 5.0 {
+        let surface_direction = if position.length_squared() > f64::EPSILON {
+            position.normalize()
+        } else {
+            DVec3::Y
+        };
+        position = surface_direction * (body.radius + 5.0);
+        vessel.position = position.to_array();
+        vessel.velocity = ground_velocity(position, body.rotation_period).to_array();
+        vessel.situation = FlightSituation::Crashed;
+        return;
+    }
+
+    let atmosphere_height = body
+        .atmosphere
+        .as_ref()
+        .map_or(0.0, |atmosphere| atmosphere.height);
+    let orbit = elements(position, vessel.velocity_vec(), body.mu, body.radius);
+    vessel.situation = if altitude > atmosphere_height && orbit.periapsis > atmosphere_height {
+        FlightSituation::Orbiting
+    } else {
+        FlightSituation::Flying
+    };
 }
 
 pub fn apply_soi_transitions(vessel: &mut Vessel, ut: f64) {
@@ -764,6 +901,93 @@ mod tests {
         apply_soi_transitions(&mut vessel, 0.0);
         assert_eq!(vessel.primary_body, "pelagos");
         assert!((vessel.position_vec() - (home_position + relative_position)).length() < 1e-4);
+    }
+
+    #[test]
+    fn high_warp_rejects_an_orbit_that_will_enter_the_atmosphere() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let body = body_definition("carapace");
+        let apoapsis_radius = body.radius + 200_000.0;
+        let periapsis_radius = body.radius + 40_000.0;
+        let semi_major_axis = (apoapsis_radius + periapsis_radius) * 0.5;
+        vessel.position = [apoapsis_radius, 0.0, 0.0];
+        vessel.velocity = [
+            0.0,
+            (body.mu * (2.0 / apoapsis_radius - 1.0 / semi_major_axis)).sqrt(),
+            0.0,
+        ];
+        vessel.situation = FlightSituation::Orbiting;
+
+        assert!(!on_rails_warp_is_safe(&vessel));
+    }
+
+    #[test]
+    fn on_rails_step_reclassifies_an_unsafe_orbit() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let body = body_definition("carapace");
+        let apoapsis_radius = body.radius + 200_000.0;
+        let periapsis_radius = body.radius + 40_000.0;
+        let semi_major_axis = (apoapsis_radius + periapsis_radius) * 0.5;
+        vessel.position = [apoapsis_radius, 0.0, 0.0];
+        vessel.velocity = [
+            0.0,
+            (body.mu * (2.0 / apoapsis_radius - 1.0 / semi_major_axis)).sqrt(),
+            0.0,
+        ];
+        vessel.situation = FlightSituation::Orbiting;
+
+        step_on_rails(&mut vessel, 1.0);
+
+        assert_eq!(vessel.situation, FlightSituation::Flying);
+    }
+
+    #[test]
+    fn on_rails_surface_encounter_crashes_even_when_the_endpoint_is_above_ground() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let body = body_definition("carapace");
+        let apoapsis_radius = body.radius + 200_000.0;
+        let periapsis_radius = body.radius - 100_000.0;
+        let semi_major_axis = (apoapsis_radius + periapsis_radius) * 0.5;
+        let period = TAU * (semi_major_axis.powi(3) / body.mu).sqrt();
+        vessel.position = [apoapsis_radius, 0.0, 0.0];
+        vessel.velocity = [
+            0.0,
+            (body.mu * (2.0 / apoapsis_radius - 1.0 / semi_major_axis)).sqrt(),
+            0.0,
+        ];
+        vessel.situation = FlightSituation::Orbiting;
+
+        // One full period returns the analytic endpoint to the starting point,
+        // but the intervening trajectory passes through the body.
+        step_on_rails(&mut vessel, period);
+
+        assert_eq!(vessel.situation, FlightSituation::Crashed);
+        assert_abs_diff_eq!(
+            vessel.position_vec().length(),
+            body.radius + 5.0,
+            epsilon = 1e-6
+        );
+    }
+
+    #[test]
+    fn soi_capture_re_evaluates_situation_for_the_new_body() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let home = body_definition("carapace");
+        let moon = body_definition("selene");
+        let (moon_position, moon_velocity) = circular_ephemeris(&moon, home.mu, 0.0);
+        vessel.position = (moon_position + DVec3::X * 300_000.0).to_array();
+        vessel.velocity = moon_velocity.to_array();
+        vessel.situation = FlightSituation::Orbiting;
+
+        step_on_rails_patched(&mut vessel, 0.0, 0.0);
+
+        assert_eq!(vessel.primary_body, "selene");
+        assert_eq!(vessel.situation, FlightSituation::Flying);
+        assert!(!on_rails_warp_is_safe(&vessel));
     }
 
     #[test]

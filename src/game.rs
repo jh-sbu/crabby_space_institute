@@ -18,7 +18,7 @@ use crate::save::{QuickSave, SAVE_SCHEMA, SaveStore};
 use crate::scripting::{COROUTINE_EXAMPLE, EXAMPLE_SCRIPT, ScriptRuntime};
 use crate::simulation::{
     FlightTelemetry, MissionProgress, SimulationClock, activate_next_stage, craft_stats,
-    step_on_rails_patched, step_vessel, telemetry, update_mission,
+    on_rails_warp_is_safe, step_on_rails_patched, step_vessel, telemetry, update_mission,
 };
 
 #[derive(States, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -643,16 +643,7 @@ fn simulate_flight(
             .unwrap_or(0);
     }
 
-    let body = body_definition(&vessel.primary_body);
-    let altitude = vessel.position_vec().length() - body.radius;
-    let atmosphere_height = body
-        .atmosphere
-        .as_ref()
-        .map_or(0.0, |atmosphere| atmosphere.height);
-    if altitude < atmosphere_height + 5_000.0
-        || vessel.controls.throttle > 0.001
-        || !matches!(vessel.situation, FlightSituation::Orbiting)
-    {
+    if vessel.controls.throttle > 0.001 || !on_rails_warp_is_safe(vessel) {
         clock.warp_index = clock.warp_index.min(2);
     }
     if let Some(node) = &vessel.maneuver
@@ -672,6 +663,9 @@ fn simulate_flight(
         step_on_rails_patched(vessel, clock.universal_time, dt);
         clock.universal_time += dt;
         *current_telemetry = telemetry(vessel, &catalog.0, clock.universal_time, 0.0);
+        if !on_rails_warp_is_safe(vessel) {
+            clock.warp_index = clock.warp_index.min(2);
+        }
     }
     update_mission(mission, vessel, current_telemetry);
     if vessel.situation == FlightSituation::Crashed {
