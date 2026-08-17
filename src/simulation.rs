@@ -1,4 +1,4 @@
-use bevy::math::{DQuat, DVec3};
+use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -28,7 +28,107 @@ fn aerodynamic_lift_force(
     fin_lift: f64,
 ) -> DVec3 {
     let crossflow = forward.reject_from(air_direction);
-    -crossflow * dynamic_pressure * fin_lift * forward.dot(air_direction).abs()
+    crossflow * dynamic_pressure * fin_lift * forward.dot(air_direction).abs()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MassProperties {
+    mass: f64,
+    center: DVec3,
+    inertia: DMat3,
+}
+
+fn part_resource_capacity(module: PartModule) -> f64 {
+    match module {
+        PartModule::LiquidTank { fuel }
+        | PartModule::MonopropTank { fuel }
+        | PartModule::SolidEngine { fuel, .. } => fuel,
+        PartModule::HeatShield { ablator } => ablator,
+        _ => 0.0,
+    }
+}
+
+fn outer_product(vector: DVec3) -> DMat3 {
+    DMat3::from_cols(vector * vector.x, vector * vector.y, vector * vector.z)
+}
+
+fn compound_mass_properties(vessel: &Vessel, catalog: &PartCatalog) -> MassProperties {
+    let parts: Vec<_> = vessel
+        .parts
+        .iter()
+        .filter(|part| !part.destroyed)
+        .filter_map(|part| {
+            let definition = catalog.get(&part.instance.definition_id)?;
+            let mass = definition.dry_mass + part.fuel + part.ablator;
+            let position = DVec3::from_array(part.instance.local_position.map(f64::from));
+            Some((part, definition, mass, position))
+        })
+        .collect();
+    let mass: f64 = parts.iter().map(|(_, _, mass, _)| mass).sum();
+    if mass <= f64::EPSILON {
+        return MassProperties {
+            mass: 1.0,
+            center: DVec3::ZERO,
+            inertia: DMat3::IDENTITY,
+        };
+    }
+
+    let center = parts
+        .iter()
+        .map(|(_, _, part_mass, position)| *position * *part_mass)
+        .sum::<DVec3>()
+        / mass;
+    let mut inertia = DMat3::ZERO;
+    for (part, definition, part_mass, position) in parts {
+        // Match the simple cylinder/cuboid geometry rendered by the editor. Rotate
+        // each part's intrinsic tensor, then use the parallel-axis theorem.
+        let radius = f64::from(definition.radius);
+        let height = f64::from(definition.height);
+        let intrinsic = if definition.radial
+            || matches!(
+                definition.module,
+                PartModule::Fin { .. } | PartModule::LandingLeg | PartModule::Rcs { .. }
+            ) {
+            let width = radius * 1.2;
+            let depth = radius * 0.65;
+            DMat3::from_diagonal(DVec3::new(
+                part_mass * (height * height + depth * depth) / 12.0,
+                part_mass * (width * width + depth * depth) / 12.0,
+                part_mass * (width * width + height * height) / 12.0,
+            ))
+        } else {
+            let transverse = part_mass * (3.0 * radius * radius + height * height) / 12.0;
+            let axial = 0.5 * part_mass * radius * radius;
+            DMat3::from_diagonal(DVec3::new(transverse, axial, transverse))
+        };
+        let rotation = DMat3::from_quat(DQuat::from_array(
+            part.instance.local_rotation.map(f64::from),
+        ));
+        let offset = position - center;
+        inertia += rotation * intrinsic * rotation.transpose()
+            + part_mass * (DMat3::IDENTITY * offset.length_squared() - outer_product(offset));
+    }
+
+    MassProperties {
+        mass,
+        center,
+        inertia,
+    }
+}
+
+fn angular_acceleration(
+    attitude: DQuat,
+    angular_velocity: DVec3,
+    torque: DVec3,
+    inertia: DMat3,
+) -> DVec3 {
+    let inverse_attitude = attitude.conjugate();
+    let local_velocity = inverse_attitude * angular_velocity;
+    let local_torque = inverse_attitude * torque;
+    let angular_momentum = inertia * local_velocity;
+    let local_acceleration =
+        inertia.inverse() * (local_torque - local_velocity.cross(angular_momentum));
+    attitude * local_acceleration
 }
 
 #[derive(Debug, Clone, Resource, Serialize, Deserialize)]
@@ -112,7 +212,9 @@ pub fn craft_stats(craft: &CraftBlueprint, catalog: &PartCatalog) -> CraftStats 
             continue;
         };
         stats.dry_mass += def.dry_mass;
-        weighted_mass_y += def.dry_mass * part.local_position[1] as f64;
+        let wet_part_mass = def.dry_mass + part_resource_capacity(def.module);
+        stats.wet_mass += wet_part_mass;
+        weighted_mass_y += wet_part_mass * part.local_position[1] as f64;
         let area = PI * def.radius as f64 * def.radius as f64 * def.drag_coefficient;
         pressure_area += area;
         pressure_y += area * part.local_position[1] as f64;
@@ -141,9 +243,8 @@ pub fn craft_stats(craft: &CraftBlueprint, catalog: &PartCatalog) -> CraftStats 
             _ => {}
         }
     }
-    stats.wet_mass = stats.dry_mass + stats.liquid_fuel + stats.solid_fuel;
-    stats.center_of_mass_y = if stats.dry_mass > 0.0 {
-        weighted_mass_y / stats.dry_mass
+    stats.center_of_mass_y = if stats.wet_mass > 0.0 {
+        weighted_mass_y / stats.wet_mass
     } else {
         0.0
     };
@@ -163,24 +264,15 @@ pub fn craft_stats(craft: &CraftBlueprint, catalog: &PartCatalog) -> CraftStats 
     } else {
         0.0
     };
-    if stats.wet_mass > stats.dry_mass && isp > 0.0 {
-        stats.vacuum_delta_v = isp * G0 * (stats.wet_mass / stats.dry_mass).ln();
+    let burnout_mass = stats.wet_mass - stats.liquid_fuel - stats.solid_fuel;
+    if stats.wet_mass > burnout_mass && burnout_mass > 0.0 && isp > 0.0 {
+        stats.vacuum_delta_v = isp * G0 * (stats.wet_mass / burnout_mass).ln();
     }
     stats
 }
 
 pub fn vessel_mass(vessel: &Vessel, catalog: &PartCatalog) -> f64 {
-    vessel
-        .parts
-        .iter()
-        .filter(|part| !part.destroyed)
-        .map(|part| {
-            catalog
-                .get(&part.instance.definition_id)
-                .map_or(0.0, |def| def.dry_mass + part.fuel + part.ablator)
-        })
-        .sum::<f64>()
-        .max(1.0)
+    compound_mass_properties(vessel, catalog).mass
 }
 
 pub fn resource_totals(vessel: &Vessel, catalog: &PartCatalog) -> (f64, f64, f64) {
@@ -358,12 +450,12 @@ pub fn step_vessel(
     let atmosphere_velocity = ground_velocity(position, body.rotation_period);
     let air_velocity = velocity - atmosphere_velocity;
     let air_speed = air_velocity.length();
-    let mass = vessel_mass(vessel, catalog);
+    let mass_properties = compound_mass_properties(vessel, catalog);
+    let mass = mass_properties.mass;
 
     let mut force = -body.mu * mass / position.length_squared().max(1.0) * radial;
     let mut torque = DVec3::ZERO;
-    let mut liquid_thrust = 0.0;
-    let mut solid_thrust = 0.0;
+    let mut applied_thrust = Vec::new();
     let mut liquid_request = 0.0;
     let throttle = vessel.controls.throttle.clamp(0.0, 1.0);
 
@@ -381,12 +473,19 @@ pub fn step_vessel(
                 thrust_sl,
                 isp_vac,
                 isp_sl,
+                gimbal_deg,
                 ..
             } => {
                 let thrust = (thrust_vac + (thrust_sl - thrust_vac) * pressure_fraction) * throttle;
                 let isp = isp_vac + (isp_sl - isp_vac) * pressure_fraction;
                 liquid_request += thrust / (isp * G0).max(1.0) * dt;
-                liquid_thrust += thrust;
+                applied_thrust.push((
+                    DVec3::from_array(part.instance.local_position.map(f64::from)),
+                    DQuat::from_array(part.instance.local_rotation.map(f64::from)) * DVec3::Y,
+                    thrust,
+                    gimbal_deg,
+                    true,
+                ));
             }
             PartModule::SolidEngine { thrust, isp, .. } if part.fuel > 0.0 => {
                 let burn = (thrust / (isp * G0) * dt).min(part.fuel);
@@ -396,7 +495,13 @@ pub fn step_vessel(
                     0.0
                 };
                 part.fuel -= burn;
-                solid_thrust += thrust * fraction;
+                applied_thrust.push((
+                    DVec3::from_array(part.instance.local_position.map(f64::from)),
+                    DQuat::from_array(part.instance.local_rotation.map(f64::from)) * DVec3::Y,
+                    thrust * fraction,
+                    0.0,
+                    false,
+                ));
                 if part.fuel <= 1e-6 {
                     part.active = false;
                 }
@@ -405,17 +510,38 @@ pub fn step_vessel(
         }
     }
     let drained = drain_resource(vessel, catalog, true, liquid_request);
-    if liquid_request > 0.0 {
-        liquid_thrust *= (drained / liquid_request).clamp(0.0, 1.0);
+    let liquid_fraction = if liquid_request > 0.0 {
+        (drained / liquid_request).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let gimbal_input = DVec3::new(vessel.controls.pitch, 0.0, -vessel.controls.yaw);
+    let gimbal_amount = gimbal_input.length().min(1.0);
+    let mut total_thrust = 0.0;
+    for (point, base_direction, mut thrust, gimbal_deg, uses_liquid) in applied_thrust {
+        if uses_liquid {
+            thrust *= liquid_fraction;
+        }
+        let offset = point - mass_properties.center;
+        let mut direction = base_direction.normalize_or_zero();
+        if gimbal_deg > 0.0 && gimbal_amount > 1e-6 {
+            let lateral = gimbal_input
+                .cross(offset)
+                .reject_from(direction)
+                .normalize_or_zero();
+            if lateral.length_squared() > 0.0 {
+                let angle = gimbal_deg.to_radians() * gimbal_amount;
+                direction = direction * angle.cos() + lateral * angle.sin();
+            }
+        }
+        let thrust_force = attitude * direction * thrust;
+        force += thrust_force;
+        torque += (attitude * offset).cross(thrust_force);
+        total_thrust += thrust;
     }
-    let total_thrust = liquid_thrust + solid_thrust;
     let forward = attitude * DVec3::Y;
-    force += forward * total_thrust;
 
     let mut control_torque = 0.0;
-    let mut fin_lift = 0.0;
-    let mut drag_area = 0.0;
-    let mut chute_area = 0.0;
     let (_, _, monopropellant) = resource_totals(vessel, catalog);
     let rcs_available = monopropellant > 1e-6;
     let mut unsafe_chutes = Vec::new();
@@ -423,13 +549,35 @@ pub fn step_vessel(
         let Some(def) = catalog.get(&part.instance.definition_id) else {
             continue;
         };
-        drag_area += PI * def.radius as f64 * def.radius as f64 * def.drag_coefficient;
+        let offset =
+            DVec3::from_array(part.instance.local_position.map(f64::from)) - mass_properties.center;
+        let world_offset = attitude * offset;
+        let part_air_velocity = air_velocity + angular_velocity.cross(world_offset);
+        let part_air_speed = part_air_velocity.length();
+        let part_air_direction = part_air_velocity.normalize_or_zero();
+        let part_dynamic_pressure = 0.5 * density * part_air_speed * part_air_speed;
+        if part_air_speed > 0.1 {
+            let drag_area = PI * f64::from(def.radius).powi(2) * def.drag_coefficient;
+            let drag_force = -part_air_direction * part_dynamic_pressure * drag_area;
+            force += drag_force;
+            torque += world_offset.cross(drag_force);
+        }
         match def.module {
             PartModule::Command { torque, .. } | PartModule::ReactionWheel { torque } => {
                 control_torque += torque
             }
             PartModule::Fin { lift, steerable } => {
-                fin_lift += lift * if steerable { 1.35 } else { 1.0 };
+                if part_air_speed > 0.1 {
+                    let fin_lift = lift * if steerable { 1.35 } else { 1.0 };
+                    let lift_force = aerodynamic_lift_force(
+                        forward,
+                        part_air_direction,
+                        part_dynamic_pressure,
+                        fin_lift,
+                    );
+                    force += lift_force;
+                    torque += world_offset.cross(lift_force);
+                }
                 if steerable {
                     control_torque += density * air_speed * air_speed * 0.6;
                 }
@@ -438,8 +586,12 @@ pub fn step_vessel(
                 drag_area,
                 safe_speed,
             } if part.parachute_deployed => {
-                if air_speed <= safe_speed || density < 0.02 {
-                    chute_area += drag_area;
+                if part_air_speed <= safe_speed || density < 0.02 {
+                    if part_air_speed > 0.1 {
+                        let chute_force = -part_air_direction * part_dynamic_pressure * drag_area;
+                        force += chute_force;
+                        torque += world_offset.cross(chute_force);
+                    }
                 } else {
                     unsafe_chutes.push(part.instance.instance_id);
                 }
@@ -450,7 +602,6 @@ pub fn step_vessel(
             _ => {}
         }
     }
-    control_torque += total_thrust * 0.045;
     if vessel.controls.rcs
         && rcs_available
         && (vessel.controls.pitch.abs() + vessel.controls.yaw.abs() + vessel.controls.roll.abs()
@@ -469,14 +620,6 @@ pub fn step_vessel(
         }
     }
 
-    if air_speed > 0.1 {
-        let dynamic_pressure = 0.5 * density * air_speed * air_speed;
-        let air_direction = air_velocity.normalize();
-        force -= air_direction * dynamic_pressure * (drag_area + chute_area);
-        force += aerodynamic_lift_force(forward, air_direction, dynamic_pressure, fin_lift);
-        torque -= angular_velocity * dynamic_pressure * fin_lift * 0.05;
-    }
-
     let local_input = DVec3::new(
         vessel.controls.pitch,
         vessel.controls.roll,
@@ -488,9 +631,8 @@ pub fn step_vessel(
         torque -= angular_velocity * control_torque * 0.7;
     }
 
-    let inertia = (mass * 18.0).max(1.0);
-    angular_velocity += torque / inertia * dt;
-    angular_velocity *= (-0.02 * dt).exp();
+    angular_velocity +=
+        angular_acceleration(attitude, angular_velocity, torque, mass_properties.inertia) * dt;
     let angle = angular_velocity.length() * dt;
     if angle > 1e-12 {
         attitude =
@@ -1057,8 +1199,118 @@ pub fn update_mission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PartCatalog, Vessel, stock_craft};
+    use crate::model::{CraftBlueprint, PartCatalog, PartInstance, Vessel, stock_craft};
     use approx::assert_abs_diff_eq;
+
+    fn part(id: u64, definition_id: &str, position: [f32; 3]) -> PartInstance {
+        PartInstance {
+            instance_id: id,
+            definition_id: definition_id.into(),
+            parent: (id != 1).then_some(1),
+            local_position: position,
+            local_rotation: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn craft_stats_center_of_mass_includes_all_resources() {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Mass test".into(),
+            parts: vec![
+                part(1, "pod_1", [0.0, 0.0, 0.0]),
+                part(2, "tank_short", [0.0, 10.0, 0.0]),
+                part(3, "mono_tank", [0.0, 20.0, 0.0]),
+                part(4, "heatshield", [0.0, 30.0, 0.0]),
+            ],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+
+        let expected_mass = 900.0 + (280.0 + 2_400.0) + (90.0 + 220.0) + (220.0 + 240.0);
+        let expected_center =
+            ((280.0 + 2_400.0) * 10.0 + (90.0 + 220.0) * 20.0 + (220.0 + 240.0) * 30.0)
+                / expected_mass;
+        let stats = craft_stats(&craft, &catalog);
+
+        assert_abs_diff_eq!(stats.wet_mass, expected_mass, epsilon = 1e-12);
+        assert_abs_diff_eq!(stats.center_of_mass_y, expected_center, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn off_axis_engine_applies_torque_about_live_center_of_mass() {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Offset thrust".into(),
+            parts: vec![
+                part(1, "pod_1", [0.0, 0.0, 0.0]),
+                part(2, "solid_stack", [2.0, -2.0, 0.0]),
+            ],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        vessel.parts[1].active = true;
+        vessel.controls.sas = None;
+        vessel.position = [
+            crate::model::HOME_RADIUS + HOME_ATMOSPHERE + 1_000.0,
+            0.0,
+            0.0,
+        ];
+        vessel.velocity = [0.0, 0.0, 0.0];
+
+        step_vessel(&mut vessel, &catalog, 0.001, 0.001);
+
+        assert!(vessel.angular_velocity[2] > 0.0);
+        assert_abs_diff_eq!(vessel.angular_velocity[0], 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn anisotropic_inertia_includes_euler_gyroscopic_term() {
+        let acceleration = angular_acceleration(
+            DQuat::IDENTITY,
+            DVec3::new(1.0, 2.0, 3.0),
+            DVec3::ZERO,
+            DMat3::from_diagonal(DVec3::new(2.0, 3.0, 4.0)),
+        );
+
+        assert_abs_diff_eq!(acceleration.x, -3.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(acceleration.y, 2.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(acceleration.z, -0.5, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn fins_behind_center_of_mass_weathervane_into_airflow() {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Stable aerodynamic test".into(),
+            parts: vec![
+                part(1, "pod_1", [0.0, 0.0, 0.0]),
+                part(2, "fin", [0.0, -4.0, 0.0]),
+            ],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        vessel.controls.sas = None;
+        vessel.situation = FlightSituation::Flying;
+        let position = DVec3::new(crate::model::HOME_RADIUS + 10_000.0, 0.0, 0.0);
+        vessel.position = position.to_array();
+        vessel.velocity = (ground_velocity(position, body_definition("carapace").rotation_period)
+            + DVec3::Y * 100.0)
+            .to_array();
+        vessel.attitude = DQuat::from_rotation_z(0.1).to_array();
+
+        step_vessel(&mut vessel, &catalog, 0.001, 0.001);
+
+        assert!(vessel.angular_velocity[2] < 0.0);
+    }
 
     #[test]
     fn aerodynamic_lift_scales_with_crossflow() {

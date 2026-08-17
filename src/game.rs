@@ -697,6 +697,11 @@ fn draw_orbits(
             Vec3::new(2.0, stats.center_of_pressure_y as f32, 0.1),
             Color::srgb(0.1, 0.7, 1.0),
         );
+        gizmos.line(
+            Vec3::new(-2.0, stats.center_of_thrust_y as f32, 0.2),
+            Vec3::new(2.0, stats.center_of_thrust_y as f32, 0.2),
+            Color::srgb(1.0, 0.25, 0.15),
+        );
         return;
     }
     if *state.get() != AppMode::Flight || !view.map {
@@ -1030,6 +1035,7 @@ fn editor_ui(
             stat(ui, "Vacuum Δv", stats.vacuum_delta_v, " m/s");
             stat(ui, "COM", stats.center_of_mass_y, " m");
             stat(ui, "COP", stats.center_of_pressure_y, " m");
+            stat(ui, "COT", stats.center_of_thrust_y, " m");
             ui.separator();
             if ui
                 .add_sized([150.0, 34.0], egui::Button::new("LAUNCH"))
