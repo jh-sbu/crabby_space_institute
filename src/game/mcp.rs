@@ -854,6 +854,7 @@ fn apply_flight_action(
             let Session {
                 vessel,
                 visual_dirty,
+                notice,
                 ..
             } = session;
             if !activate_stage(
@@ -861,6 +862,7 @@ fn apply_flight_action(
                 catalog,
                 visual_dirty,
                 runtime,
+                notice,
             ) {
                 return Err("the vessel has no remaining stages".into());
             }
@@ -1677,6 +1679,10 @@ mod tests {
             *app.world().resource::<State<AppMode>>().get(),
             AppMode::Flight
         );
+        assert_eq!(
+            app.world().resource::<Session>().notice,
+            "Flight systems ready. Press Space to activate stage 1/4: Ignition."
+        );
 
         run_request(
             &mut app,
@@ -1704,6 +1710,10 @@ mod tests {
             assert_eq!(vessel.controls.throttle, 1.0);
             assert_eq!(vessel.next_stage, 1);
             assert!(vessel.parts.iter().any(|part| part.active));
+            assert_eq!(
+                session.notice,
+                "Stage 1/4 activated: Ignition. Next: Shed boosters."
+            );
         }
 
         for _ in 0..600 {

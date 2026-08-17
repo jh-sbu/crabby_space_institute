@@ -1,7 +1,7 @@
 use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::{PI, TAU};
 
 use crate::model::{
@@ -215,6 +215,8 @@ pub struct MissionProgress {
     pub staged: bool,
     pub achieved_orbit: bool,
     pub began_reentry: bool,
+    /// The guided mission reached safe recovery after orbit and atmospheric reentry.
+    /// Physical touchdown readiness is represented by `FlightSituation::Landed`.
     pub recovered: bool,
 }
 
@@ -346,19 +348,14 @@ pub fn resource_totals(vessel: &Vessel, catalog: &PartCatalog) -> (f64, f64, f64
     (liquid, solid, mono)
 }
 
-fn drain_resource(vessel: &mut Vessel, catalog: &PartCatalog, liquid: bool, amount: f64) -> f64 {
+fn drain_monopropellant(vessel: &mut Vessel, catalog: &PartCatalog, amount: f64) -> f64 {
     let available: f64 = vessel
         .parts
         .iter()
         .filter(|part| !part.destroyed)
         .filter_map(|part| {
             let def = catalog.get(&part.instance.definition_id)?;
-            let matches = if liquid {
-                matches!(def.module, PartModule::LiquidTank { .. })
-            } else {
-                matches!(def.module, PartModule::MonopropTank { .. })
-            };
-            matches.then_some(part.fuel)
+            matches!(def.module, PartModule::MonopropTank { .. }).then_some(part.fuel)
         })
         .sum();
     let taken = available.min(amount);
@@ -369,12 +366,90 @@ fn drain_resource(vessel: &mut Vessel, catalog: &PartCatalog, liquid: bool, amou
         let Some(def) = catalog.get(&part.instance.definition_id) else {
             continue;
         };
-        let matches = if liquid {
-            matches!(def.module, PartModule::LiquidTank { .. })
-        } else {
-            matches!(def.module, PartModule::MonopropTank { .. })
+        if matches!(def.module, PartModule::MonopropTank { .. }) {
+            part.fuel = (part.fuel - taken * part.fuel / available).max(0.0);
+        }
+    }
+    taken
+}
+
+fn blocks_liquid_crossfeed(part: &crate::model::RuntimePart, catalog: &PartCatalog) -> bool {
+    catalog
+        .get(&part.instance.definition_id)
+        .is_some_and(|definition| {
+            matches!(
+                definition.module,
+                PartModule::InlineDecoupler { .. } | PartModule::RadialDecoupler { .. }
+            )
+        })
+}
+
+fn liquid_fuel_network(vessel: &Vessel, catalog: &PartCatalog, start: u64) -> BTreeSet<u64> {
+    let Some(start_part) = vessel.parts.iter().find(|part| {
+        part.instance.instance_id == start
+            && !part.destroyed
+            && !blocks_liquid_crossfeed(part, catalog)
+    }) else {
+        return BTreeSet::new();
+    };
+    let mut network = BTreeSet::from([start_part.instance.instance_id]);
+    loop {
+        let before = network.len();
+        for candidate in vessel
+            .parts
+            .iter()
+            .filter(|part| !part.destroyed && !blocks_liquid_crossfeed(part, catalog))
+        {
+            let candidate_id = candidate.instance.instance_id;
+            if network.contains(&candidate_id) {
+                continue;
+            }
+            let connected = candidate
+                .instance
+                .parent
+                .is_some_and(|parent| network.contains(&parent))
+                || vessel.parts.iter().any(|member| {
+                    network.contains(&member.instance.instance_id)
+                        && member.instance.parent == Some(candidate_id)
+                });
+            if connected {
+                network.insert(candidate_id);
+            }
+        }
+        if network.len() == before {
+            return network;
+        }
+    }
+}
+
+fn drain_liquid_fuel_network(
+    vessel: &mut Vessel,
+    catalog: &PartCatalog,
+    network: &BTreeSet<u64>,
+    amount: f64,
+) -> f64 {
+    let available: f64 = vessel
+        .parts
+        .iter()
+        .filter(|part| !part.destroyed && network.contains(&part.instance.instance_id))
+        .filter_map(|part| {
+            let definition = catalog.get(&part.instance.definition_id)?;
+            matches!(definition.module, PartModule::LiquidTank { .. }).then_some(part.fuel)
+        })
+        .sum();
+    let taken = available.min(amount);
+    if available <= 0.0 {
+        return 0.0;
+    }
+    for part in vessel
+        .parts
+        .iter_mut()
+        .filter(|part| !part.destroyed && network.contains(&part.instance.instance_id))
+    {
+        let Some(definition) = catalog.get(&part.instance.definition_id) else {
+            continue;
         };
-        if matches {
+        if matches!(definition.module, PartModule::LiquidTank { .. }) {
             part.fuel = (part.fuel - taken * part.fuel / available).max(0.0);
         }
     }
@@ -611,8 +686,48 @@ pub fn step_vessel(
     let mut force = DVec3::ZERO;
     let mut torque = DVec3::ZERO;
     let mut applied_thrust = Vec::new();
-    let mut liquid_request = 0.0;
+    let mut liquid_networks: BTreeMap<u64, (BTreeSet<u64>, f64)> = BTreeMap::new();
     let throttle = vessel.controls.throttle.clamp(0.0, 1.0);
+
+    for part in vessel
+        .parts
+        .iter()
+        .filter(|part| part.active && !part.destroyed)
+    {
+        let Some(def) = catalog.get(&part.instance.definition_id) else {
+            continue;
+        };
+        let PartModule::LiquidEngine {
+            thrust_vac,
+            thrust_sl,
+            isp_vac,
+            isp_sl,
+            gimbal_deg,
+            ..
+        } = def.module
+        else {
+            continue;
+        };
+        let thrust = (thrust_vac + (thrust_sl - thrust_vac) * pressure_fraction) * throttle;
+        let isp = isp_vac + (isp_sl - isp_vac) * pressure_fraction;
+        let request = thrust / (isp * G0).max(1.0) * dt;
+        let network = liquid_fuel_network(vessel, catalog, part.instance.instance_id);
+        let network_id = network
+            .first()
+            .copied()
+            .unwrap_or(part.instance.instance_id);
+        liquid_networks
+            .entry(network_id)
+            .and_modify(|(_, total_request)| *total_request += request)
+            .or_insert((network, request));
+        applied_thrust.push((
+            DVec3::from_array(part.instance.local_position.map(f64::from)),
+            DQuat::from_array(part.instance.local_rotation.map(f64::from)) * DVec3::Y,
+            thrust,
+            gimbal_deg,
+            Some(network_id),
+        ));
+    }
 
     for part in vessel
         .parts
@@ -623,25 +738,6 @@ pub fn step_vessel(
             continue;
         };
         match def.module {
-            PartModule::LiquidEngine {
-                thrust_vac,
-                thrust_sl,
-                isp_vac,
-                isp_sl,
-                gimbal_deg,
-                ..
-            } => {
-                let thrust = (thrust_vac + (thrust_sl - thrust_vac) * pressure_fraction) * throttle;
-                let isp = isp_vac + (isp_sl - isp_vac) * pressure_fraction;
-                liquid_request += thrust / (isp * G0).max(1.0) * dt;
-                applied_thrust.push((
-                    DVec3::from_array(part.instance.local_position.map(f64::from)),
-                    DQuat::from_array(part.instance.local_rotation.map(f64::from)) * DVec3::Y,
-                    thrust,
-                    gimbal_deg,
-                    true,
-                ));
-            }
             PartModule::SolidEngine { thrust, isp, .. } if part.fuel > 0.0 => {
                 let burn = (thrust / (isp * G0) * dt).min(part.fuel);
                 let fraction = if dt > 0.0 {
@@ -655,7 +751,7 @@ pub fn step_vessel(
                     DQuat::from_array(part.instance.local_rotation.map(f64::from)) * DVec3::Y,
                     thrust * fraction,
                     0.0,
-                    false,
+                    None,
                 ));
                 if part.fuel <= 1e-6 {
                     part.active = false;
@@ -664,12 +760,18 @@ pub fn step_vessel(
             _ => {}
         }
     }
-    let drained = drain_resource(vessel, catalog, true, liquid_request);
-    let liquid_fraction = if liquid_request > 0.0 {
-        (drained / liquid_request).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
+    let liquid_fractions: BTreeMap<_, _> = liquid_networks
+        .into_iter()
+        .map(|(network_id, (network, request))| {
+            let drained = drain_liquid_fuel_network(vessel, catalog, &network, request);
+            let fraction = if request > 0.0 {
+                (drained / request).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            (network_id, fraction)
+        })
+        .collect();
     let post_burn_mass_properties = compound_mass_properties(vessel, catalog);
     // Midpoint properties keep the burn first-order accurate while avoiding
     // the systematic pre-burn-mass bias of sampling only at frame start.
@@ -682,9 +784,9 @@ pub fn step_vessel(
     let gimbal_input = DVec3::new(vessel.controls.pitch, 0.0, -vessel.controls.yaw);
     let gimbal_amount = gimbal_input.length().min(1.0);
     let mut total_thrust = 0.0;
-    for (point, base_direction, mut thrust, gimbal_deg, uses_liquid) in applied_thrust {
-        if uses_liquid {
-            thrust *= liquid_fraction;
+    for (point, base_direction, mut thrust, gimbal_deg, liquid_network) in applied_thrust {
+        if let Some(network_id) = liquid_network {
+            thrust *= liquid_fractions.get(&network_id).copied().unwrap_or(0.0);
         }
         let offset = point - mass_properties.center;
         let mut direction = base_direction.normalize_or_zero();
@@ -774,7 +876,7 @@ pub fn step_vessel(
             > 0.01
             || vessel.controls.sas.is_some())
     {
-        drain_resource(vessel, catalog, false, 0.18 * dt);
+        drain_monopropellant(vessel, catalog, 0.18 * dt);
     }
     for id in unsafe_chutes {
         if let Some(part) = vessel
@@ -1622,6 +1724,228 @@ mod tests {
         assert!(after.0 < before.0);
         assert!(after.1 < before.1);
         assert!(vessel.position_vec().length() > crate::model::HOME_RADIUS + 5.0);
+    }
+
+    #[test]
+    fn inline_decoupler_preserves_stock_upper_stage_fuel() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let fuel = |vessel: &Vessel, id| {
+            vessel
+                .parts
+                .iter()
+                .find(|part| part.instance.instance_id == id)
+                .unwrap()
+                .fuel
+        };
+        let upper_before = fuel(&vessel, 4);
+        let lower_before = fuel(&vessel, 8);
+
+        activate_next_stage(&mut vessel, &catalog);
+        vessel.controls.throttle = 1.0;
+        step_vessel(&mut vessel, &catalog, 1.0 / 60.0, 0.0);
+
+        assert_eq!(fuel(&vessel, 4), upper_before);
+        assert!(fuel(&vessel, 8) < lower_before);
+
+        activate_next_stage(&mut vessel, &catalog);
+        activate_next_stage(&mut vessel, &catalog);
+        let upper_stage_before = fuel(&vessel, 4);
+        step_vessel(&mut vessel, &catalog, 1.0 / 60.0, 1.0 / 60.0);
+
+        assert!(fuel(&vessel, 4) < upper_stage_before);
+    }
+
+    #[test]
+    fn radial_decoupler_isolates_independent_liquid_fuel_networks() {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Crossfeed test".into(),
+            parts: vec![
+                part(1, "pod_1", [0.0, 0.0, 0.0]),
+                PartInstance {
+                    instance_id: 2,
+                    definition_id: "tank_short".into(),
+                    parent: Some(1),
+                    local_position: [0.0, -1.0, 0.0],
+                    local_rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                PartInstance {
+                    instance_id: 3,
+                    definition_id: "engine_sl_s".into(),
+                    parent: Some(2),
+                    local_position: [0.0, -2.0, 0.0],
+                    local_rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                PartInstance {
+                    instance_id: 4,
+                    definition_id: "decoupler_radial".into(),
+                    parent: Some(2),
+                    local_position: [2.0, -1.0, 0.0],
+                    local_rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                PartInstance {
+                    instance_id: 5,
+                    definition_id: "tank_long".into(),
+                    parent: Some(4),
+                    local_position: [3.0, -1.0, 0.0],
+                    local_rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                PartInstance {
+                    instance_id: 6,
+                    definition_id: "engine_sl_s".into(),
+                    parent: Some(5),
+                    local_position: [3.0, -3.0, 0.0],
+                    local_rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        vessel.parts[1].fuel = 0.0;
+        vessel.parts[2].active = true;
+        vessel.parts[5].active = true;
+        vessel.controls.throttle = 1.0;
+        let booster_fuel_before = vessel.parts[4].fuel;
+        let body = body_definition("carapace");
+        let (_, pressure_fraction) = atmosphere(&body, 5.0);
+        let expected_thrust = match catalog.get("engine_sl_s").unwrap().module {
+            PartModule::LiquidEngine {
+                thrust_vac,
+                thrust_sl,
+                ..
+            } => thrust_vac + (thrust_sl - thrust_vac) * pressure_fraction,
+            _ => unreachable!(),
+        };
+
+        let data = step_vessel(&mut vessel, &catalog, 1.0 / 60.0, 0.0);
+
+        assert_abs_diff_eq!(data.thrust, expected_thrust, epsilon = 1e-9);
+        assert_eq!(vessel.parts[1].fuel, 0.0);
+        assert!(vessel.parts[4].fuel < booster_fuel_before);
+    }
+
+    #[test]
+    fn tanks_in_one_liquid_network_drain_proportionally() {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Shared fuel network".into(),
+            parts: vec![
+                part(1, "pod_1", [0.0, 0.0, 0.0]),
+                PartInstance {
+                    instance_id: 2,
+                    definition_id: "tank_short".into(),
+                    parent: Some(1),
+                    local_position: [0.0, -1.0, 0.0],
+                    local_rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                PartInstance {
+                    instance_id: 3,
+                    definition_id: "tank_long".into(),
+                    parent: Some(2),
+                    local_position: [0.0, -3.0, 0.0],
+                    local_rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                PartInstance {
+                    instance_id: 4,
+                    definition_id: "engine_sl_s".into(),
+                    parent: Some(3),
+                    local_position: [0.0, -5.0, 0.0],
+                    local_rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        let short_before = vessel.parts[1].fuel;
+        let long_before = vessel.parts[2].fuel;
+        let network = liquid_fuel_network(&vessel, &catalog, 4);
+
+        let drained = drain_liquid_fuel_network(&mut vessel, &catalog, &network, 100.0);
+
+        assert_eq!(drained, 100.0);
+        assert_abs_diff_eq!(
+            (short_before - vessel.parts[1].fuel) / short_before,
+            (long_before - vessel.parts[2].fuel) / long_before,
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn suborbital_landing_is_not_guided_mission_recovery() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let mut progress = MissionProgress::default();
+        let mut data = FlightTelemetry {
+            altitude: 100.0,
+            ..Default::default()
+        };
+
+        update_mission(&mut progress, &vessel, &data);
+        vessel.situation = FlightSituation::Landed;
+        data.altitude = 5.0;
+        update_mission(&mut progress, &vessel, &data);
+
+        assert!(progress.launched);
+        assert!(!progress.achieved_orbit);
+        assert!(!progress.began_reentry);
+        assert!(!progress.recovered);
+    }
+
+    #[test]
+    fn orbital_reentry_latches_guided_mission_recovery_on_landing() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let mut progress = MissionProgress::default();
+        activate_next_stage(&mut vessel, &catalog);
+        activate_next_stage(&mut vessel, &catalog);
+        let mut data = FlightTelemetry {
+            altitude: 80_000.0,
+            orbit: OrbitalElements {
+                periapsis: 75_000.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        update_mission(&mut progress, &vessel, &data);
+        vessel.situation = FlightSituation::Landed;
+        data.altitude = 5.0;
+        update_mission(&mut progress, &vessel, &data);
+
+        assert!(progress.launched);
+        assert!(progress.staged);
+        assert!(progress.achieved_orbit);
+        assert!(progress.began_reentry);
+        assert!(progress.recovered);
+    }
+
+    #[test]
+    fn crash_does_not_complete_guided_mission_recovery() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        vessel.situation = FlightSituation::Crashed;
+        let mut progress = MissionProgress {
+            launched: true,
+            staged: true,
+            achieved_orbit: true,
+            began_reentry: true,
+            recovered: false,
+        };
+        let data = FlightTelemetry {
+            altitude: 5.0,
+            ..Default::default()
+        };
+
+        update_mission(&mut progress, &vessel, &data);
+
+        assert!(!progress.recovered);
     }
 
     #[test]

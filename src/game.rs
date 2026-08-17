@@ -588,7 +588,7 @@ fn flight_input(
         vessel.controls.throttle = 0.0;
     }
     if keys.just_pressed(KeyCode::Space) {
-        activate_stage(vessel, &catalog.0, visual_dirty, &mut runtime);
+        activate_stage(vessel, &catalog.0, visual_dirty, &mut runtime, notice);
     }
     if keys.just_pressed(KeyCode::KeyT) {
         vessel.controls.sas = if vessel.controls.sas.is_some() {
@@ -640,13 +640,61 @@ fn activate_stage(
     catalog: &PartCatalog,
     visual_dirty: &mut bool,
     runtime: &mut ScriptRuntime,
+    notice: &mut String,
 ) -> bool {
+    if !activate_stage_state(vessel, catalog, visual_dirty, notice) {
+        return false;
+    }
+    runtime.emit_event("stage");
+    true
+}
+
+fn activate_stage_state(
+    vessel: &mut Vessel,
+    catalog: &PartCatalog,
+    visual_dirty: &mut bool,
+    notice: &mut String,
+) -> bool {
+    let stage_index = vessel.next_stage;
+    let Some(stage_name) = vessel
+        .stages
+        .get(stage_index)
+        .map(|stage| stage.name.clone())
+    else {
+        return false;
+    };
     if !activate_next_stage(vessel, catalog) {
         return false;
     }
     *visual_dirty = true;
-    runtime.emit_event("stage");
+    *notice = if let Some(next) = vessel.stages.get(vessel.next_stage) {
+        format!(
+            "Stage {}/{} activated: {stage_name}. Next: {}.",
+            stage_index + 1,
+            vessel.stages.len(),
+            next.name
+        )
+    } else {
+        format!(
+            "Stage {}/{} activated: {stage_name}. No stages remaining.",
+            stage_index + 1,
+            vessel.stages.len()
+        )
+    };
     true
+}
+
+fn flight_ready_notice(craft: &CraftBlueprint) -> String {
+    craft.stages.first().map_or_else(
+        || "Flight systems ready. No stages are configured.".into(),
+        |stage| {
+            format!(
+                "Flight systems ready. Press Space to activate stage 1/{}: {}.",
+                craft.stages.len(),
+                stage.name
+            )
+        },
+    )
 }
 
 fn save_quicksave(
@@ -715,8 +763,8 @@ fn simulate_flight(
     if let Some(value) = commands.rcs {
         vessel.controls.rcs = value;
     }
-    if commands.stage && activate_next_stage(vessel, &catalog.0) {
-        *visual_dirty = true;
+    if commands.stage {
+        activate_stage_state(vessel, &catalog.0, visual_dirty, notice);
     }
     if commands.deploy_parachutes {
         for part in &mut vessel.parts {
@@ -1337,11 +1385,12 @@ fn apply_editor_action(
                     }
                 })
                 .collect();
-            session.notice = if warnings.is_empty() {
-                "Flight systems ready. Space ignites the first stage.".into()
-            } else {
-                format!("Launched with warnings: {}", warnings.join("; "))
-            };
+            session.notice = flight_ready_notice(&session.craft);
+            if !warnings.is_empty() {
+                session
+                    .notice
+                    .push_str(&format!(" Warnings: {}", warnings.join("; ")));
+            }
             remote_input.release_attitude_controls();
             session.vessel = Some(Vessel::from_blueprint(&session.craft, catalog));
             session.telemetry = session
@@ -1463,7 +1512,13 @@ fn flight_ui(
             .show(viewport_ui, |ui| {
                 ui.heading("Flight plan");
                 if ui.button("ACTIVATE NEXT STAGE [Space]").clicked() {
-                    activate_stage(vessel, catalog, &mut session.visual_dirty, runtime);
+                    activate_stage(
+                        vessel,
+                        catalog,
+                        &mut session.visual_dirty,
+                        runtime,
+                        &mut session.notice,
+                    );
                 }
                 if let Some(stage) = vessel.stages.get(vessel.next_stage) {
                     ui.small(format!("Next: {}", stage.name));
@@ -1951,6 +2006,52 @@ mod tests {
             yaw: Some(-0.5),
             roll: Some(0.25),
         }
+    }
+
+    #[test]
+    fn stage_notices_track_current_and_next_stage() {
+        let catalog = PartCatalog::default();
+        let craft = stock_craft();
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        let mut notice = flight_ready_notice(&craft);
+        let mut visual_dirty = false;
+
+        assert_eq!(
+            notice,
+            "Flight systems ready. Press Space to activate stage 1/4: Ignition."
+        );
+        assert!(activate_stage_state(
+            &mut vessel,
+            &catalog,
+            &mut visual_dirty,
+            &mut notice
+        ));
+        assert_eq!(
+            notice,
+            "Stage 1/4 activated: Ignition. Next: Shed boosters."
+        );
+        assert!(visual_dirty);
+
+        for _ in 0..3 {
+            assert!(activate_stage_state(
+                &mut vessel,
+                &catalog,
+                &mut visual_dirty,
+                &mut notice
+            ));
+        }
+        assert_eq!(
+            notice,
+            "Stage 4/4 activated: Recovery. No stages remaining."
+        );
+        let final_notice = notice.clone();
+        assert!(!activate_stage_state(
+            &mut vessel,
+            &catalog,
+            &mut visual_dirty,
+            &mut notice
+        ));
+        assert_eq!(notice, final_notice);
     }
 
     #[test]
