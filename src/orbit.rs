@@ -209,34 +209,92 @@ fn stumpff_s(z: f64) -> f64 {
     }
 }
 
+fn initial_universal_anomaly(
+    position: DVec3,
+    velocity: DVec3,
+    mu: f64,
+    dt: f64,
+    alpha: f64,
+) -> f64 {
+    let r0 = position.length();
+    let sqrt_mu = mu.sqrt();
+
+    if alpha > 1e-8 {
+        return sqrt_mu * dt * alpha;
+    }
+
+    if alpha < 0.0 {
+        // Curtis, Orbital Mechanics for Engineering Students, Algorithm 3.3.
+        // The elliptic estimate above is not a valid hyperbolic estimate: using
+        // |alpha| there can send Newton's method far into the overflowing cosh
+        // branch of the Stumpff functions.
+        let a = alpha.recip();
+        let direction = dt.signum();
+        let log_argument = (-2.0 * mu * alpha * dt)
+            / (position.dot(velocity) + direction * (-mu * a).sqrt() * (1.0 - r0 * alpha));
+        if log_argument.is_finite() && log_argument > 0.0 {
+            let estimate = direction * (-a).sqrt() * log_argument.ln();
+            if estimate.is_finite() && estimate.signum() == direction {
+                return estimate;
+            }
+        }
+    }
+
+    // A well-scaled, correctly signed estimate for near-parabolic states and
+    // the rare hyperbolic geometry for which the logarithmic estimate is poor.
+    sqrt_mu * dt / r0
+}
+
+fn solve_universal_anomaly(
+    position: DVec3,
+    velocity: DVec3,
+    mu: f64,
+    dt: f64,
+    alpha: f64,
+) -> Option<f64> {
+    const MAX_ITERATIONS: usize = 64;
+    const RELATIVE_STEP_TOLERANCE: f64 = 1e-12;
+
+    let r0 = position.length();
+    let vr0 = position.dot(velocity) / r0;
+    let sqrt_mu = mu.sqrt();
+    let mut x = initial_universal_anomaly(position, velocity, mu, dt, alpha);
+
+    for _ in 0..MAX_ITERATIONS {
+        let z = alpha * x * x;
+        let c = stumpff_c(z);
+        let s = stumpff_s(z);
+        let value = r0 * vr0 / sqrt_mu * x * x * c + (1.0 - alpha * r0) * x * x * x * s + r0 * x
+            - sqrt_mu * dt;
+        let derivative =
+            r0 * vr0 / sqrt_mu * x * (1.0 - z * s) + (1.0 - alpha * r0) * x * x * c + r0;
+        let dx = value / derivative;
+        if !dx.is_finite() {
+            return None;
+        }
+
+        x -= dx;
+        if !x.is_finite() {
+            return None;
+        }
+        if dx.abs() <= RELATIVE_STEP_TOLERANCE * (1.0 + x.abs()) {
+            return Some(x);
+        }
+    }
+
+    None
+}
+
 /// Propagate a two-body state with the universal-variable f/g solution.
 pub fn propagate_universal(position: DVec3, velocity: DVec3, mu: f64, dt: f64) -> (DVec3, DVec3) {
     if dt.abs() < f64::EPSILON {
         return (position, velocity);
     }
     let r0 = position.length();
-    let vr0 = position.dot(velocity) / r0;
     let alpha = 2.0 / r0 - velocity.length_squared() / mu;
     let sqrt_mu = mu.sqrt();
-    let mut x = if alpha.abs() > 1e-8 {
-        sqrt_mu * dt * alpha.abs()
-    } else {
-        sqrt_mu * dt / r0
-    };
-
-    for _ in 0..64 {
-        let z = alpha * x * x;
-        let c = stumpff_c(z);
-        let s = stumpff_s(z);
-        let f = r0 * vr0 / sqrt_mu * x * x * c + (1.0 - alpha * r0) * x * x * x * s + r0 * x
-            - sqrt_mu * dt;
-        let df = r0 * vr0 / sqrt_mu * x * (1.0 - z * s) + (1.0 - alpha * r0) * x * x * c + r0;
-        let dx = f / df;
-        x -= dx;
-        if dx.abs() < 1e-9 {
-            break;
-        }
-    }
+    let x = solve_universal_anomaly(position, velocity, mu, dt, alpha)
+        .expect("universal-variable Kepler solver failed to converge");
 
     let z = alpha * x * x;
     let c = stumpff_c(z);
@@ -317,5 +375,64 @@ mod tests {
     fn home_soi_contains_selene() {
         let soi = sphere_of_influence(13.6e9, HOME_MU, 1.327e18);
         assert!(soi > 12.0e6);
+    }
+
+    #[test]
+    fn long_hyperbolic_propagation_is_finite_and_conserves_energy() {
+        let radius = HOME_RADIUS + 100_000.0;
+
+        for eccentricity in [1.21, 1.88, 3.5, 7.0] {
+            let position = DVec3::X * radius;
+            let velocity = DVec3::Y * (HOME_MU * (1.0 + eccentricity) / radius).sqrt();
+            let initial_energy = velocity.length_squared() * 0.5 - HOME_MU / radius;
+
+            for dt in [2_000.0, 7_200.0, 30_000.0, 86_400.0] {
+                let (next_position, next_velocity) =
+                    propagate_universal(position, velocity, HOME_MU, dt);
+                let final_energy =
+                    next_velocity.length_squared() * 0.5 - HOME_MU / next_position.length();
+
+                assert!(next_position.is_finite());
+                assert!(next_velocity.is_finite());
+                assert_relative_eq!(
+                    final_energy,
+                    initial_energy,
+                    max_relative = 2e-11,
+                    epsilon = 1e-6
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hyperbolic_propagation_is_reversible() {
+        let radius = HOME_RADIUS + 100_000.0;
+        let position = DVec3::X * radius;
+        let velocity = DVec3::Y * (HOME_MU * 4.5 / radius).sqrt();
+        let (later_position, later_velocity) =
+            propagate_universal(position, velocity, HOME_MU, 86_400.0);
+        let (restored_position, restored_velocity) =
+            propagate_universal(later_position, later_velocity, HOME_MU, -86_400.0);
+
+        assert_relative_eq!(restored_position.x, position.x, epsilon = 1e-5);
+        assert_relative_eq!(restored_position.y, position.y, epsilon = 1e-5);
+        assert_relative_eq!(restored_velocity.x, velocity.x, epsilon = 2e-8);
+        assert_relative_eq!(restored_velocity.y, velocity.y, epsilon = 2e-8);
+    }
+
+    #[test]
+    fn sampled_hyperbolic_trajectory_keeps_moving_outward() {
+        let radius = HOME_RADIUS + 100_000.0;
+        let position = DVec3::X * radius;
+        let velocity = DVec3::Y * (HOME_MU * 4.5 / radius).sqrt();
+        let points = sample_trajectory(position, velocity, HOME_MU, HOME_RADIUS, 160);
+
+        assert_eq!(points.len(), 161);
+        assert!(points.iter().all(|point| point.is_finite()));
+        assert!(
+            points
+                .windows(2)
+                .all(|pair| pair[1].length() >= pair[0].length())
+        );
     }
 }
