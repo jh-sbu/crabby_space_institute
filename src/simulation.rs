@@ -15,6 +15,16 @@ use crate::orbit::{
 
 const G0: f64 = 9.80665;
 
+fn aerodynamic_lift_force(
+    forward: DVec3,
+    air_direction: DVec3,
+    dynamic_pressure: f64,
+    fin_lift: f64,
+) -> DVec3 {
+    let crossflow = forward.reject_from(air_direction);
+    -crossflow * dynamic_pressure * fin_lift * forward.dot(air_direction).abs()
+}
+
 #[derive(Debug, Clone, Resource, Serialize, Deserialize)]
 pub struct SimulationClock {
     pub universal_time: f64,
@@ -455,12 +465,9 @@ pub fn step_vessel(
 
     if air_speed > 0.1 {
         let dynamic_pressure = 0.5 * density * air_speed * air_speed;
-        force -= air_velocity.normalize() * dynamic_pressure * (drag_area + chute_area);
-        let desired = forward
-            .reject_from(air_velocity.normalize())
-            .normalize_or_zero();
-        force -=
-            desired * dynamic_pressure * fin_lift * forward.dot(air_velocity.normalize()).abs();
+        let air_direction = air_velocity.normalize();
+        force -= air_direction * dynamic_pressure * (drag_area + chute_area);
+        force += aerodynamic_lift_force(forward, air_direction, dynamic_pressure, fin_lift);
         torque -= angular_velocity * dynamic_pressure * fin_lift * 0.05;
     }
 
@@ -677,6 +684,21 @@ pub fn update_mission(
 mod tests {
     use super::*;
     use crate::model::{PartCatalog, Vessel, stock_craft};
+    use approx::assert_abs_diff_eq;
+
+    #[test]
+    fn aerodynamic_lift_scales_with_crossflow() {
+        let lift_at = |angle_degrees: f64| {
+            let angle = angle_degrees.to_radians();
+            let forward = DVec3::new(angle.sin(), angle.cos(), 0.0);
+            aerodynamic_lift_force(forward, DVec3::Y, 1.0, 1.0).length()
+        };
+
+        assert_eq!(lift_at(0.0), 0.0);
+        assert!(lift_at(0.001) < 0.000_018);
+        assert_abs_diff_eq!(lift_at(30.0), 3.0_f64.sqrt() / 4.0, epsilon = 1e-12);
+        assert!(lift_at(90.0) < 1e-12);
+    }
 
     #[test]
     fn staging_activates_then_sheds_boosters() {
