@@ -556,15 +556,28 @@ fn apply_game_action(
                     enter_vehicle_assembly(session, runtime, next_state);
                     Ok(())
                 }
-                MenuActionParams::ContinueQuicksave => {
-                    continue_quicksave(session, &store.0, clock, runtime, view, next_state)
-                }
+                MenuActionParams::ContinueQuicksave => continue_quicksave(
+                    session,
+                    &store.0,
+                    clock,
+                    runtime,
+                    view,
+                    next_state,
+                    remote_input,
+                ),
             }
         }
         GameAction::Assembly(action) => {
             require_mode(mode, AppMode::Editor)?;
             apply_assembly_action(
-                action, next_state, session, &catalog.0, &store.0, editor, runtime,
+                action,
+                next_state,
+                session,
+                &catalog.0,
+                &store.0,
+                editor,
+                runtime,
+                remote_input,
             )
         }
         GameAction::SetFlightControls(params) => {
@@ -618,6 +631,7 @@ fn apply_assembly_action(
     store: &crate::save::SaveStore,
     editor: &mut EditorState,
     runtime: &mut ScriptRuntime,
+    remote_input: &mut RemoteFlightInput,
 ) -> Result<(), String> {
     let error_prefix = match &action {
         AssemblyActionParams::SaveCraft => Some("Craft save failed:"),
@@ -711,6 +725,7 @@ fn apply_assembly_action(
         store,
         editor,
         runtime,
+        remote_input,
     );
     if error_prefix.is_some_and(|prefix| session.notice.starts_with(prefix)) {
         Err(session.notice.clone())
@@ -775,10 +790,7 @@ fn apply_flight_action(
 ) -> Result<(), String> {
     match action {
         FlightActionParams::ReturnToAssembly => {
-            remote_input.pitch = None;
-            remote_input.yaw = None;
-            remote_input.roll = None;
-            return_to_assembly(session, runtime, next_state);
+            return_to_assembly(session, runtime, next_state, remote_input);
         }
         FlightActionParams::ActivateNextStage => {
             let Session {
@@ -796,9 +808,7 @@ fn apply_flight_action(
             }
         }
         FlightActionParams::ReleaseAttitudeControls => {
-            remote_input.pitch = None;
-            remote_input.yaw = None;
-            remote_input.roll = None;
+            remote_input.release_attitude_controls();
             let vessel = session.vessel.as_mut().expect("flight mode has a vessel");
             vessel.controls.pitch = 0.0;
             vessel.controls.yaw = 0.0;
@@ -844,7 +854,7 @@ fn apply_flight_action(
             };
         }
         FlightActionParams::Quickload => {
-            load_quicksave(session, store, clock, runtime);
+            load_quicksave(session, store, clock, runtime, remote_input);
             if session.notice.starts_with("Load failed:") {
                 return Err(session.notice.clone());
             }
@@ -1269,7 +1279,7 @@ impl GameStateMcp {
     }
 
     #[tool(
-        description = "Set flight controls. Throttle latches like player throttle; supplied pitch/yaw/roll axes remain overridden until flight_action release_attitude_controls"
+        description = "Set flight controls. Throttle latches like player throttle; supplied pitch/yaw/roll axes remain overridden until released explicitly or by a flight lifecycle transition"
     )]
     async fn set_flight_controls(
         &self,

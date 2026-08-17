@@ -98,6 +98,6 @@ For example, this sequence enters Vehicle Assembly, launches the stock craft thr
 {"tool":"flight_action","arguments":{"action":"activate_next_stage"}}
 ```
 
-Supplied MCP pitch, yaw, and roll axes remain latched across frames so a client can emulate held flight keys. Call `flight_action` with `{"action":"release_attitude_controls"}` to release all three axes back to the physical keyboard. Throttle remains set, matching the player's latched throttle control. Action tools reject invalid modes, identifiers, and ranges without bypassing gameplay validation. `Quit` is intentionally not exposed because it would sever the debugging connection.
+Supplied MCP pitch, yaw, and roll axes remain latched across frames so a client can emulate held flight keys. Call `flight_action` with `{"action":"release_attitude_controls"}` to release all three axes back to the physical keyboard; they are also released when leaving flight, launching a vessel, or loading a quicksave. Throttle remains set, matching the player's latched throttle control. Action tools reject invalid modes, identifiers, and ranges without bypassing gameplay validation. `Quit` is intentionally not exposed because it would sever the debugging connection.
 
 The MCP code and its networking dependencies are excluded unless the `mcp` feature is enabled.

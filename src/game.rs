@@ -106,6 +106,14 @@ struct RemoteFlightInput {
     roll: Option<f64>,
 }
 
+impl RemoteFlightInput {
+    fn release_attitude_controls(&mut self) {
+        self.pitch = None;
+        self.yaw = None;
+        self.roll = None;
+    }
+}
+
 #[derive(Component)]
 struct MainCamera;
 #[derive(Component)]
@@ -541,7 +549,7 @@ fn flight_input(
     mut clock: ResMut<SimulationClock>,
     mut runtime: ResMut<ScriptRuntime>,
     mut view: ResMut<ViewState>,
-    remote_input: Res<RemoteFlightInput>,
+    mut remote_input: ResMut<RemoteFlightInput>,
 ) {
     if *state.get() != AppMode::Flight || wants_input.wants_keyboard_input() {
         return;
@@ -618,6 +626,7 @@ fn flight_input(
                 *clock = save.clock;
                 *mission = save.mission;
                 let _ = runtime.load(save.script_source, save.script_state);
+                remote_input.release_attitude_controls();
                 *visual_dirty = true;
                 *notice = "Quicksave restored".into();
             }
@@ -891,6 +900,7 @@ fn game_ui(
     mut view: ResMut<ViewState>,
     mut clock: ResMut<SimulationClock>,
     mut runtime: ResMut<ScriptRuntime>,
+    mut remote_input: ResMut<RemoteFlightInput>,
     mut app_exit: MessageWriter<AppExit>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -922,6 +932,7 @@ fn game_ui(
             &mut clock,
             &mut runtime,
             &mut view,
+            &mut remote_input,
             &mut app_exit,
         ),
         AppMode::Editor => editor_ui(
@@ -933,6 +944,7 @@ fn game_ui(
             &store.0,
             &mut editor,
             &mut runtime,
+            &mut remote_input,
         ),
         AppMode::Flight => flight_ui(
             ctx,
@@ -944,6 +956,7 @@ fn game_ui(
             &mut view,
             &mut clock,
             &mut runtime,
+            &mut remote_input,
         ),
     }
     Ok(())
@@ -957,6 +970,7 @@ fn menu_ui(
     clock: &mut SimulationClock,
     runtime: &mut ScriptRuntime,
     view: &mut ViewState,
+    remote_input: &mut RemoteFlightInput,
     app_exit: &mut MessageWriter<AppExit>,
 ) {
     egui::CentralPanel::default().show(viewport_ui, |ui| {
@@ -970,7 +984,15 @@ fn menu_ui(
                 enter_vehicle_assembly(session, runtime, next_state);
             }
             if store.quicksave_exists() && ui.add_sized([260.0, 42.0], egui::Button::new("Continue Quicksave")).clicked() {
-                let _ = continue_quicksave(session, store, clock, runtime, view, next_state);
+                let _ = continue_quicksave(
+                    session,
+                    store,
+                    clock,
+                    runtime,
+                    view,
+                    next_state,
+                    remote_input,
+                );
             }
             if ui.add_sized([260.0, 42.0], egui::Button::new("Quit")).clicked() { app_exit.write(AppExit::Success); }
             ui.add_space(24.0);
@@ -1000,6 +1022,7 @@ fn continue_quicksave(
     runtime: &mut ScriptRuntime,
     view: &mut ViewState,
     next_state: &mut NextState<AppMode>,
+    remote_input: &mut RemoteFlightInput,
 ) -> Result<(), String> {
     let save = store.load_quick().map_err(|error| {
         let message = format!("Could not load quicksave: {error}");
@@ -1015,6 +1038,7 @@ fn continue_quicksave(
     };
     session.visual_dirty = true;
     view.map = false;
+    remote_input.release_attitude_controls();
     next_state.set(AppMode::Flight);
     Ok(())
 }
@@ -1040,6 +1064,7 @@ fn editor_ui(
     store: &SaveStore,
     editor: &mut EditorState,
     runtime: &mut ScriptRuntime,
+    remote_input: &mut RemoteFlightInput,
 ) {
     let mut action = None;
     egui::Panel::top("editor_top").show(viewport_ui, |ui| {
@@ -1184,7 +1209,16 @@ fn editor_ui(
     }
 
     if let Some(action) = action {
-        apply_editor_action(action, next_state, session, catalog, store, editor, runtime);
+        apply_editor_action(
+            action,
+            next_state,
+            session,
+            catalog,
+            store,
+            editor,
+            runtime,
+            remote_input,
+        );
     }
 }
 
@@ -1196,6 +1230,7 @@ fn apply_editor_action(
     store: &SaveStore,
     editor: &mut EditorState,
     runtime: &mut ScriptRuntime,
+    remote_input: &mut RemoteFlightInput,
 ) {
     match action {
         EditorAction::Add(definition) => {
@@ -1307,6 +1342,7 @@ fn apply_editor_action(
             } else {
                 format!("Launched with warnings: {}", warnings.join("; "))
             };
+            remote_input.release_attitude_controls();
             session.vessel = Some(Vessel::from_blueprint(&session.craft, catalog));
             session.telemetry = session
                 .vessel
@@ -1331,11 +1367,12 @@ fn flight_ui(
     view: &mut ViewState,
     clock: &mut SimulationClock,
     runtime: &mut ScriptRuntime,
+    remote_input: &mut RemoteFlightInput,
 ) {
     egui::Panel::top("flight_top").show(viewport_ui, |ui| {
         ui.horizontal(|ui| {
             if ui.button("Assembly").clicked() {
-                return_to_assembly(session, runtime, next_state);
+                return_to_assembly(session, runtime, next_state, remote_input);
             }
             if ui.selectable_label(view.map, "Map [M]").clicked() {
                 view.map = !view.map;
@@ -1367,7 +1404,7 @@ fn flight_ui(
                     .unwrap_or_else(|error| error);
             }
             if ui.button("F9 Load").clicked() {
-                load_quicksave(session, store, clock, runtime);
+                load_quicksave(session, store, clock, runtime, remote_input);
             }
             if ui.button("Lua").clicked() {
                 view.show_script_console = !view.show_script_console;
@@ -1491,9 +1528,11 @@ fn return_to_assembly(
     session: &mut Session,
     runtime: &mut ScriptRuntime,
     next_state: &mut NextState<AppMode>,
+    remote_input: &mut RemoteFlightInput,
 ) {
     runtime.stop();
     session.visual_dirty = true;
+    remote_input.release_attitude_controls();
     next_state.set(AppMode::Editor);
 }
 
@@ -1839,6 +1878,7 @@ fn load_quicksave(
     store: &SaveStore,
     clock: &mut SimulationClock,
     runtime: &mut ScriptRuntime,
+    remote_input: &mut RemoteFlightInput,
 ) {
     match store.load_quick() {
         Ok(save) => {
@@ -1850,6 +1890,7 @@ fn load_quicksave(
                 Err(error) => format!("Flight restored; script paused: {error}"),
             };
             session.visual_dirty = true;
+            remote_input.release_attitude_controls();
         }
         Err(error) => session.notice = format!("Load failed: {error}"),
     }
@@ -1897,5 +1938,85 @@ fn draw_crab(ui: &mut egui::Ui, size: f32) {
             size * 0.025,
             egui::Color32::BLACK,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn latched_remote_input() -> RemoteFlightInput {
+        RemoteFlightInput {
+            pitch: Some(1.0),
+            yaw: Some(-0.5),
+            roll: Some(0.25),
+        }
+    }
+
+    #[test]
+    fn flight_mode_transitions_release_remote_attitude_controls() {
+        let catalog = PartCatalog::default();
+        let mut session = Session::default();
+        let mut next_state = NextState::<AppMode>::default();
+        let mut editor = EditorState::default();
+        let mut runtime = ScriptRuntime::default();
+        let mut remote_input = latched_remote_input();
+
+        apply_editor_action(
+            EditorAction::Launch,
+            &mut next_state,
+            &mut session,
+            &catalog,
+            &SaveStore::default(),
+            &mut editor,
+            &mut runtime,
+            &mut remote_input,
+        );
+        assert!(session.vessel.is_some());
+        assert!(remote_input.pitch.is_none());
+        assert!(remote_input.yaw.is_none());
+        assert!(remote_input.roll.is_none());
+
+        remote_input = latched_remote_input();
+        return_to_assembly(
+            &mut session,
+            &mut runtime,
+            &mut next_state,
+            &mut remote_input,
+        );
+        assert!(remote_input.pitch.is_none());
+        assert!(remote_input.yaw.is_none());
+        assert!(remote_input.roll.is_none());
+    }
+
+    #[test]
+    fn quickload_releases_remote_attitude_controls() {
+        let root = std::env::temp_dir().join(format!(
+            "crabby-space-input-reset-test-{}",
+            std::process::id()
+        ));
+        let store = SaveStore::at(root.clone());
+        let catalog = PartCatalog::default();
+        let vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let mission = MissionProgress::default();
+        let mut clock = SimulationClock::default();
+        let mut runtime = ScriptRuntime::default();
+        save_quicksave(&vessel, &mission, &clock, &runtime, &store).unwrap();
+
+        let mut session = Session::default();
+        let mut remote_input = latched_remote_input();
+        load_quicksave(
+            &mut session,
+            &store,
+            &mut clock,
+            &mut runtime,
+            &mut remote_input,
+        );
+
+        assert!(session.vessel.is_some());
+        assert!(remote_input.pitch.is_none());
+        assert!(remote_input.yaw.is_none());
+        assert!(remote_input.roll.is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 }
