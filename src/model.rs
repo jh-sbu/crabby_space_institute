@@ -646,6 +646,35 @@ pub struct RuntimePart {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetachedStage {
+    pub primary_body: String,
+    pub parts: Vec<RuntimePart>,
+    pub position: [f64; 3],
+    pub velocity: [f64; 3],
+    pub attitude: [f64; 4],
+    pub angular_velocity: [f64; 3],
+}
+
+impl DetachedStage {
+    pub fn position_vec(&self) -> DVec3 {
+        DVec3::from_array(self.position)
+    }
+
+    pub fn velocity_vec(&self) -> DVec3 {
+        DVec3::from_array(self.velocity)
+    }
+
+    pub fn attitude_quat(&self) -> DQuat {
+        DQuat::from_xyzw(
+            self.attitude[0],
+            self.attitude[1],
+            self.attitude[2],
+            self.attitude[3],
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManeuverNode {
     pub ut: f64,
     pub prograde: f64,
@@ -678,6 +707,8 @@ pub struct Vessel {
     pub max_heating: f64,
     pub maneuver: Option<ManeuverNode>,
     pub crew: Vec<String>,
+    #[serde(default)]
+    pub debris: Vec<DetachedStage>,
 }
 
 impl Vessel {
@@ -723,6 +754,7 @@ impl Vessel {
             max_heating: 0.0,
             maneuver: None,
             crew: blueprint.crew.clone(),
+            debris: Vec::new(),
         }
     }
 

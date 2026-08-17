@@ -104,6 +104,7 @@ struct MapMarker;
 #[derive(Component)]
 struct PartVisual {
     id: u64,
+    debris: Option<usize>,
 }
 
 pub fn run() {
@@ -229,23 +230,41 @@ fn rebuild_visuals(
             .craft
             .parts
             .iter()
-            .map(|part| (part.clone(), false, false))
+            .map(|part| (part.clone(), false, false, None))
             .collect(),
         AppMode::Flight => session
             .vessel
             .as_ref()
             .map(|vessel| {
-                vessel
+                let mut parts: Vec<_> = vessel
                     .parts
                     .iter()
                     .filter(|part| !part.destroyed)
-                    .map(|part| (part.instance.clone(), part.parachute_deployed, part.active))
-                    .collect()
+                    .map(|part| {
+                        (
+                            part.instance.clone(),
+                            part.parachute_deployed,
+                            part.active,
+                            None,
+                        )
+                    })
+                    .collect();
+                for (debris_index, stage) in vessel.debris.iter().enumerate() {
+                    parts.extend(stage.parts.iter().map(|part| {
+                        (
+                            part.instance.clone(),
+                            part.parachute_deployed,
+                            part.active,
+                            Some(debris_index),
+                        )
+                    }));
+                }
+                parts
             })
             .unwrap_or_default(),
         AppMode::Menu => Vec::new(),
     };
-    for (part, chute_open, active) in source {
+    for (part, chute_open, active, debris) in source {
         let Some(def) = catalog.0.get(&part.definition_id) else {
             continue;
         };
@@ -277,6 +296,7 @@ fn rebuild_visuals(
                     .with_scale(Vec3::new(3.2, 0.55, 3.2)),
                 PartVisual {
                     id: part.instance_id,
+                    debris,
                 },
             ));
         } else {
@@ -295,6 +315,7 @@ fn rebuild_visuals(
                 Transform::from_translation(position).with_rotation(rotation),
                 PartVisual {
                     id: part.instance_id,
+                    debris,
                 },
             ));
         }
@@ -442,6 +463,12 @@ fn update_visuals(
                     Visibility::Hidden
                 };
                 let attitude = vessel.attitude_quat().as_quat();
+                let (vessel_root_position, _) = vessel_root_state(
+                    &vessel.primary_body,
+                    vessel.position_vec(),
+                    vessel.velocity_vec(),
+                    clock.universal_time,
+                );
                 let offset = match view.camera_mode % 3 {
                     0 => Vec3::new(18.0, 10.0, 22.0),
                     1 => Vec3::new(0.0, 4.0, 30.0),
@@ -450,10 +477,31 @@ fn update_visuals(
                 *camera = Transform::from_translation(offset).looking_at(Vec3::ZERO, Vec3::Y);
                 for (visual, mut transform, mut visibility) in &mut parts {
                     *visibility = Visibility::Visible;
-                    if let Some(runtime) = vessel
-                        .parts
-                        .iter()
-                        .find(|part| part.instance.instance_id == visual.id)
+                    if let Some(debris_index) = visual.debris
+                        && let Some(stage) = vessel.debris.get(debris_index)
+                        && let Some(runtime) = stage
+                            .parts
+                            .iter()
+                            .find(|part| part.instance.instance_id == visual.id)
+                    {
+                        let (debris_root_position, _) = vessel_root_state(
+                            &stage.primary_body,
+                            stage.position_vec(),
+                            stage.velocity_vec(),
+                            clock.universal_time,
+                        );
+                        let local = Vec3::from_array(runtime.instance.local_position);
+                        let debris_attitude = stage.attitude_quat().as_quat();
+                        transform.translation = (debris_root_position - vessel_root_position)
+                            .as_vec3()
+                            + debris_attitude * local;
+                        transform.rotation =
+                            debris_attitude * Quat::from_array(runtime.instance.local_rotation);
+                    } else if visual.debris.is_none()
+                        && let Some(runtime) = vessel
+                            .parts
+                            .iter()
+                            .find(|part| part.instance.instance_id == visual.id)
                     {
                         let local = Vec3::from_array(runtime.instance.local_position);
                         transform.translation = attitude * local;
@@ -655,8 +703,8 @@ fn simulate_flight(
     if rate <= 4.0 {
         let steps = rate as usize;
         for _ in 0..steps {
-            clock.universal_time += 1.0 / 60.0;
             *current_telemetry = step_vessel(vessel, &catalog.0, 1.0 / 60.0, clock.universal_time);
+            clock.universal_time += 1.0 / 60.0;
         }
     } else {
         let dt = rate / 60.0;

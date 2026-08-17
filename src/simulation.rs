@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use std::f64::consts::{PI, TAU};
 
 use crate::model::{
-    CraftBlueprint, FlightSituation, HOME_ATMOSPHERE, PartCatalog, PartModule, SasMode,
-    StageAction, Vessel,
+    CraftBlueprint, DetachedStage, FlightSituation, HOME_ATMOSPHERE, PartCatalog, PartDefinition,
+    PartModule, SasMode, StageAction, Vessel,
 };
 use crate::orbit::{
     CelestialBodyDef, OrbitalElements, body_definition, celestial_system, circular_ephemeris,
@@ -20,6 +20,12 @@ const SOI_RELEASE_FACTOR: f64 = 1.01;
 const SOI_SWEEP_SEGMENT_FRACTION: f64 = 0.25;
 const SOI_SWEEP_MAX_SEGMENTS: usize = 4_096;
 const MAX_SOI_TRANSITIONS_PER_STEP: usize = 8;
+const HEAT_CAPACITY_RATIO: f64 = 1.4;
+const UPRIGHT_VERTICAL_IMPACT_LIMIT: f64 = 18.0;
+const BROADSIDE_VERTICAL_IMPACT_LIMIT: f64 = 8.0;
+const HORIZONTAL_IMPACT_LIMIT: f64 = 8.0;
+const LANDING_LEG_VERTICAL_BONUS: f64 = 8.0;
+const LANDING_LEG_HORIZONTAL_BONUS: f64 = 3.0;
 
 fn aerodynamic_lift_force(
     forward: DVec3,
@@ -29,6 +35,54 @@ fn aerodynamic_lift_force(
 ) -> DVec3 {
     let crossflow = forward.reject_from(air_direction);
     crossflow * dynamic_pressure * fin_lift * forward.dot(air_direction).abs()
+}
+
+fn projected_drag_area(
+    definition: &PartDefinition,
+    world_rotation: DQuat,
+    air_direction: DVec3,
+) -> f64 {
+    let local_direction = world_rotation.conjugate() * air_direction.normalize_or_zero();
+    let radius = f64::from(definition.radius);
+    let height = f64::from(definition.height);
+    let area = if definition.radial
+        || matches!(
+            definition.module,
+            PartModule::Fin { .. } | PartModule::LandingLeg | PartModule::Rcs { .. }
+        ) {
+        let width = radius * 1.2;
+        let depth = radius * 0.65;
+        local_direction.x.abs() * height * depth
+            + local_direction.y.abs() * width * depth
+            + local_direction.z.abs() * width * height
+    } else {
+        let axial = local_direction.y.abs();
+        PI * radius * radius * axial + 2.0 * radius * height * (1.0 - axial * axial).max(0.0).sqrt()
+    };
+    area * definition.drag_coefficient
+}
+
+fn heat_rate(body: &CelestialBodyDef, position: DVec3, velocity: DVec3) -> f64 {
+    let altitude = position.length() - body.radius;
+    let (density, _) = atmosphere(body, altitude);
+    if density <= 0.0 {
+        return 0.0;
+    }
+    let relative = velocity - ground_velocity(position, body.rotation_period);
+    1.1e-7 * density.sqrt() * relative.length().powi(3)
+}
+
+fn speed_of_sound(body: &CelestialBodyDef, altitude: f64) -> Option<f64> {
+    let atmosphere = body.atmosphere.as_ref()?;
+    if altitude >= atmosphere.height {
+        return None;
+    }
+    let radius = body.radius + altitude.max(0.0);
+    let gravity = body.mu / radius.powi(2);
+    // For the isothermal atmospheres used here, H = R*T/g and
+    // c = sqrt(gamma*R*T), so the existing scale height supplies a
+    // body-specific sound speed without another independent tuning value.
+    Some((HEAT_CAPACITY_RATIO * gravity * atmosphere.scale_height).sqrt())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -347,6 +401,84 @@ fn descendants(vessel: &Vessel, root: u64) -> BTreeSet<u64> {
     result
 }
 
+fn decouple(vessel: &mut Vessel, catalog: &PartCatalog, root: u64) {
+    let Some(root_part) = vessel
+        .parts
+        .iter()
+        .find(|part| part.instance.instance_id == root && !part.destroyed)
+    else {
+        return;
+    };
+    let Some(definition) = catalog.get(&root_part.instance.definition_id) else {
+        return;
+    };
+    let root_rotation = root_part.instance.local_rotation;
+    let impulse = match definition.module {
+        PartModule::InlineDecoupler { impulse } | PartModule::RadialDecoupler { impulse } => {
+            impulse
+        }
+        _ => return,
+    };
+
+    let removed = descendants(vessel, root);
+    let mut detached_mass = 0.0;
+    let mut detached_center = DVec3::ZERO;
+    for part in vessel
+        .parts
+        .iter()
+        .filter(|part| !part.destroyed && removed.contains(&part.instance.instance_id))
+    {
+        let Some(definition) = catalog.get(&part.instance.definition_id) else {
+            continue;
+        };
+        let mass = definition.dry_mass + part.fuel + part.ablator;
+        let position = DVec3::from_array(part.instance.local_position.map(f64::from));
+        detached_mass += mass;
+        detached_center += position * mass;
+    }
+    if detached_mass <= f64::EPSILON {
+        return;
+    }
+    detached_center /= detached_mass;
+
+    let mut detached_parts = Vec::new();
+    for part in &mut vessel.parts {
+        if removed.contains(&part.instance.instance_id) && !part.destroyed {
+            let mut detached = part.clone();
+            let position = DVec3::from_array(detached.instance.local_position.map(f64::from))
+                - detached_center;
+            detached.instance.local_position = position.as_vec3().to_array();
+            detached_parts.push(detached);
+            part.destroyed = true;
+            part.active = false;
+        }
+    }
+
+    let remaining = compound_mass_properties(vessel, catalog);
+    let local_separation = (detached_center - remaining.center).normalize_or_zero();
+    let local_separation = if local_separation.length_squared() > 0.0 {
+        local_separation
+    } else {
+        DQuat::from_array(root_rotation.map(f64::from)) * -DVec3::Y
+    };
+    let attitude = vessel.attitude_quat().normalize();
+    let world_offset = attitude * detached_center;
+    let separation = attitude * local_separation;
+    let original_velocity = vessel.velocity_vec();
+    let detached_velocity = original_velocity
+        + vessel.angular_velocity_vec().cross(world_offset)
+        + separation * (impulse / detached_mass);
+    vessel.velocity = (original_velocity - separation * (impulse / remaining.mass)).to_array();
+    vessel.debris.push(DetachedStage {
+        primary_body: vessel.primary_body.clone(),
+        parts: detached_parts,
+        position: (vessel.position_vec() + world_offset).to_array(),
+        velocity: detached_velocity.to_array(),
+        attitude: vessel.attitude,
+        angular_velocity: vessel.angular_velocity,
+    });
+}
+
 pub fn activate_next_stage(vessel: &mut Vessel, catalog: &PartCatalog) -> bool {
     let Some(stage) = vessel.stages.get(vessel.next_stage).cloned() else {
         return false;
@@ -363,13 +495,7 @@ pub fn activate_next_stage(vessel: &mut Vessel, catalog: &PartCatalog) -> bool {
                 }
             }
             StageAction::Decouple(id) => {
-                let removed = descendants(vessel, id);
-                for part in &mut vessel.parts {
-                    if removed.contains(&part.instance.instance_id) {
-                        part.destroyed = true;
-                        part.active = false;
-                    }
-                }
+                decouple(vessel, catalog, id);
             }
             StageAction::DeployParachute(id) => {
                 if let Some(part) = vessel
@@ -430,6 +556,36 @@ fn sas_torque(
     local_forward.cross(target) * available * 1.8
 }
 
+fn touchdown_is_survivable(
+    vessel: &Vessel,
+    catalog: &PartCatalog,
+    attitude: DQuat,
+    radial: DVec3,
+    surface_relative_velocity: DVec3,
+) -> bool {
+    let upright = (attitude * DVec3::Y).dot(radial).clamp(0.0, 1.0);
+    let leg_count = vessel
+        .parts
+        .iter()
+        .filter(|part| !part.destroyed)
+        .filter(|part| {
+            catalog
+                .get(&part.instance.definition_id)
+                .is_some_and(|definition| matches!(definition.module, PartModule::LandingLeg))
+        })
+        .count();
+    let leg_support = (leg_count as f64 / 3.0).clamp(0.0, 1.0) * upright;
+    let vertical_limit = BROADSIDE_VERTICAL_IMPACT_LIMIT
+        + (UPRIGHT_VERTICAL_IMPACT_LIMIT - BROADSIDE_VERTICAL_IMPACT_LIMIT) * upright
+        + LANDING_LEG_VERTICAL_BONUS * leg_support;
+    let horizontal_limit = HORIZONTAL_IMPACT_LIMIT + LANDING_LEG_HORIZONTAL_BONUS * leg_support;
+    let vertical_speed = surface_relative_velocity.dot(radial).min(0.0).abs();
+    let horizontal_speed = surface_relative_velocity.reject_from(radial).length();
+    // Combine the vertical and lateral envelopes rather than allowing both
+    // components to independently reach their maximum survivable value.
+    (vertical_speed / vertical_limit).powi(2) + (horizontal_speed / horizontal_limit).powi(2) <= 1.0
+}
+
 pub fn step_vessel(
     vessel: &mut Vessel,
     catalog: &PartCatalog,
@@ -450,10 +606,9 @@ pub fn step_vessel(
     let atmosphere_velocity = ground_velocity(position, body.rotation_period);
     let air_velocity = velocity - atmosphere_velocity;
     let air_speed = air_velocity.length();
-    let mass_properties = compound_mass_properties(vessel, catalog);
-    let mass = mass_properties.mass;
+    let pre_burn_mass_properties = compound_mass_properties(vessel, catalog);
 
-    let mut force = -body.mu * mass / position.length_squared().max(1.0) * radial;
+    let mut force = DVec3::ZERO;
     let mut torque = DVec3::ZERO;
     let mut applied_thrust = Vec::new();
     let mut liquid_request = 0.0;
@@ -515,6 +670,15 @@ pub fn step_vessel(
     } else {
         1.0
     };
+    let post_burn_mass_properties = compound_mass_properties(vessel, catalog);
+    // Midpoint properties keep the burn first-order accurate while avoiding
+    // the systematic pre-burn-mass bias of sampling only at frame start.
+    let mass_properties = MassProperties {
+        mass: (pre_burn_mass_properties.mass + post_burn_mass_properties.mass) * 0.5,
+        center: (pre_burn_mass_properties.center + post_burn_mass_properties.center) * 0.5,
+        inertia: (pre_burn_mass_properties.inertia + post_burn_mass_properties.inertia) * 0.5,
+    };
+    let mass = mass_properties.mass;
     let gimbal_input = DVec3::new(vessel.controls.pitch, 0.0, -vessel.controls.yaw);
     let gimbal_amount = gimbal_input.length().min(1.0);
     let mut total_thrust = 0.0;
@@ -557,7 +721,9 @@ pub fn step_vessel(
         let part_air_direction = part_air_velocity.normalize_or_zero();
         let part_dynamic_pressure = 0.5 * density * part_air_speed * part_air_speed;
         if part_air_speed > 0.1 {
-            let drag_area = PI * f64::from(def.radius).powi(2) * def.drag_coefficient;
+            let part_rotation =
+                attitude * DQuat::from_array(part.instance.local_rotation.map(f64::from));
+            let drag_area = projected_drag_area(def, part_rotation, part_air_direction);
             let drag_force = -part_air_direction * part_dynamic_pressure * drag_area;
             force += drag_force;
             torque += world_offset.cross(drag_force);
@@ -639,16 +805,12 @@ pub fn step_vessel(
             (DQuat::from_axis_angle(angular_velocity.normalize(), angle) * attitude).normalize();
     }
 
-    let acceleration = force / mass;
+    let acceleration = -body.mu / position.length_squared().max(1.0) * radial + force / mass;
     velocity += acceleration * dt;
     position += velocity * dt;
 
-    let heat_rate = if density > 0.0 {
-        1.1e-7 * density.sqrt() * air_speed.powi(3)
-    } else {
-        0.0
-    };
-    vessel.max_heating = heat_rate;
+    let heat_rate = heat_rate(&body, position, velocity);
+    vessel.max_heating = vessel.max_heating.max(heat_rate);
     let mut failed = Vec::new();
     let shield_available = vessel
         .parts
@@ -690,11 +852,17 @@ pub fn step_vessel(
     let new_altitude = position.length() - body.radius;
     if new_altitude <= 5.0 {
         let surface_velocity = ground_velocity(position, body.rotation_period);
-        let impact_speed = (velocity - surface_velocity).length();
+        let surface_relative_velocity = velocity - surface_velocity;
         position = position.normalize_or_zero() * (body.radius + 5.0);
         if vessel.situation == FlightSituation::Prelaunch && total_thrust < mass * G0 * 1.02 {
             velocity = surface_velocity;
-        } else if impact_speed > 18.0 {
+        } else if !touchdown_is_survivable(
+            vessel,
+            catalog,
+            attitude,
+            position.normalize_or_zero(),
+            surface_relative_velocity,
+        ) {
             vessel.situation = FlightSituation::Crashed;
             velocity = surface_velocity;
         } else {
@@ -734,8 +902,35 @@ pub fn step_vessel(
     vessel.velocity = velocity.to_array();
     vessel.attitude = [attitude.x, attitude.y, attitude.z, attitude.w];
     vessel.angular_velocity = angular_velocity.to_array();
-    apply_soi_transitions(vessel, ut);
-    telemetry(vessel, catalog, ut, total_thrust)
+    step_debris(vessel, dt);
+    apply_soi_transitions(vessel, ut + dt);
+    telemetry(vessel, catalog, ut + dt, total_thrust)
+}
+
+fn step_debris(vessel: &mut Vessel, dt: f64) {
+    for debris in &mut vessel.debris {
+        let body = body_definition(&debris.primary_body);
+        let mut position = debris.position_vec();
+        let mut velocity = debris.velocity_vec();
+        let radial = position.normalize_or_zero();
+        velocity += -body.mu / position.length_squared().max(1.0) * radial * dt;
+        position += velocity * dt;
+        if position.length() <= body.radius + 5.0 {
+            position = position.normalize_or_zero() * (body.radius + 5.0);
+            velocity = ground_velocity(position, body.rotation_period);
+        }
+
+        let angular_velocity = DVec3::from_array(debris.angular_velocity);
+        let angle = angular_velocity.length() * dt;
+        let mut attitude = debris.attitude_quat();
+        if angle > 1e-12 {
+            attitude = (DQuat::from_axis_angle(angular_velocity.normalize(), angle) * attitude)
+                .normalize();
+        }
+        debris.position = position.to_array();
+        debris.velocity = velocity.to_array();
+        debris.attitude = attitude.to_array();
+    }
 }
 
 pub fn step_on_rails(vessel: &mut Vessel, dt: f64) {
@@ -749,6 +944,17 @@ pub fn step_on_rails(vessel: &mut Vessel, dt: f64) {
         propagate_universal(vessel.position_vec(), vessel.velocity_vec(), body.mu, dt);
     vessel.position = position.to_array();
     vessel.velocity = velocity.to_array();
+    for debris in &mut vessel.debris {
+        let debris_body = body_definition(&debris.primary_body);
+        let (position, velocity) = propagate_universal(
+            debris.position_vec(),
+            debris.velocity_vec(),
+            debris_body.mu,
+            dt,
+        );
+        debris.position = position.to_array();
+        debris.velocity = velocity.to_array();
+    }
     update_on_rails_situation(vessel, surface_encountered);
 }
 
@@ -1161,6 +1367,9 @@ pub fn telemetry(vessel: &Vessel, catalog: &PartCatalog, ut: f64, thrust: f64) -
     let (density, _) = atmosphere(&body, altitude);
     let mass = vessel_mass(vessel, catalog);
     let (liquid, solid, mono) = resource_totals(vessel, catalog);
+    let mach = speed_of_sound(&body, altitude)
+        .map(|sound_speed| relative.length() / sound_speed)
+        .unwrap_or(0.0);
     FlightTelemetry {
         ut,
         altitude,
@@ -1168,9 +1377,9 @@ pub fn telemetry(vessel: &Vessel, catalog: &PartCatalog, ut: f64, thrust: f64) -
         speed: velocity.length(),
         surface_speed: relative.length(),
         vertical_speed: relative.dot(position.normalize_or_zero()),
-        mach: relative.length() / 343.0,
+        mach,
         dynamic_pressure: 0.5 * density * relative.length_squared(),
-        heating: vessel.max_heating,
+        heating: heat_rate(&body, position, velocity),
         mass,
         liquid_fuel: liquid,
         solid_fuel: solid,
@@ -1348,6 +1557,55 @@ mod tests {
                 .unwrap()
                 .destroyed
         );
+        assert_eq!(vessel.debris.len(), 2);
+        assert!(vessel.debris.iter().all(|stage| !stage.parts.is_empty()));
+    }
+
+    #[test]
+    fn separator_impulse_is_equal_and_opposite() {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Separation test".into(),
+            parts: vec![
+                part(1, "pod_1", [0.0, 0.0, 0.0]),
+                part(2, "decoupler_radial", [2.0, 0.0, 0.0]),
+                PartInstance {
+                    instance_id: 3,
+                    definition_id: "solid_radial".into(),
+                    parent: Some(2),
+                    local_position: [3.0, 0.0, 0.0],
+                    local_rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
+            stages: vec![crate::model::Stage {
+                name: "Separate".into(),
+                actions: vec![StageAction::Decouple(2)],
+            }],
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        vessel.angular_velocity = [0.0; 3];
+        let initial_velocity = vessel.velocity_vec();
+
+        activate_next_stage(&mut vessel, &catalog);
+
+        let survivor_mass = vessel_mass(&vessel, &catalog);
+        let debris = &vessel.debris[0];
+        let debris_mass: f64 = debris
+            .parts
+            .iter()
+            .map(|part| {
+                let definition = catalog.get(&part.instance.definition_id).unwrap();
+                definition.dry_mass + part.fuel + part.ablator
+            })
+            .sum();
+        let survivor_momentum = (vessel.velocity_vec() - initial_velocity) * survivor_mass;
+        let debris_momentum = (debris.velocity_vec() - initial_velocity) * debris_mass;
+        assert_abs_diff_eq!(survivor_momentum.length(), 2_000.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(debris_momentum.length(), 2_000.0, epsilon = 1e-9);
+        assert!((survivor_momentum + debris_momentum).length() < 1e-9);
     }
 
     #[test]
@@ -1364,6 +1622,38 @@ mod tests {
         assert!(after.0 < before.0);
         assert!(after.1 < before.1);
         assert!(vessel.position_vec().length() > crate::model::HOME_RADIUS + 5.0);
+    }
+
+    #[test]
+    fn burn_acceleration_uses_midpoint_mass() {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Mass integration test".into(),
+            parts: vec![
+                part(1, "pod_1", [0.0, 0.0, 0.0]),
+                part(2, "solid_stack", [0.0, 0.0, 0.0]),
+            ],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        vessel.parts[1].active = true;
+        vessel.controls.sas = None;
+        vessel.position = [
+            crate::model::HOME_RADIUS + HOME_ATMOSPHERE + 1_000.0,
+            0.0,
+            0.0,
+        ];
+        vessel.velocity = [0.0; 3];
+        let initial_mass = vessel_mass(&vessel, &catalog);
+        let burn = 180_000.0 / (245.0 * G0);
+        let expected_delta_v = 180_000.0 / (initial_mass - burn * 0.5);
+
+        step_vessel(&mut vessel, &catalog, 1.0, 0.0);
+
+        assert_abs_diff_eq!(vessel.velocity[1], expected_delta_v, epsilon = 1e-10);
     }
 
     #[test]
@@ -1525,5 +1815,112 @@ mod tests {
         let telemetry = step_vessel(&mut vessel, &catalog, 0.1, 0.1);
         assert!(telemetry.heating > 0.0);
         assert!(vessel.parts[0].temperature > before);
+    }
+
+    #[test]
+    fn peak_heating_is_retained_while_telemetry_reports_current_flux() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        vessel.position = [0.0, crate::model::HOME_RADIUS + 30_000.0, 0.0];
+        vessel.velocity = [2_400.0, 0.0, 0.0];
+        let hot = step_vessel(&mut vessel, &catalog, 0.1, 0.0);
+        let peak = vessel.max_heating;
+        assert!(peak > 0.0);
+        assert!(hot.heating > 0.0);
+
+        vessel.position = [
+            0.0,
+            crate::model::HOME_RADIUS + HOME_ATMOSPHERE + 1_000.0,
+            0.0,
+        ];
+        vessel.velocity = [0.0; 3];
+        let cold = step_vessel(&mut vessel, &catalog, 0.1, 0.1);
+
+        assert_eq!(cold.heating, 0.0);
+        assert_eq!(vessel.max_heating, peak);
+    }
+
+    #[test]
+    fn projected_drag_distinguishes_nose_first_and_broadside() {
+        let catalog = PartCatalog::default();
+        let tank = catalog.get("tank_long").unwrap();
+        let nose_first = projected_drag_area(tank, DQuat::IDENTITY, DVec3::Y);
+        let broadside = projected_drag_area(tank, DQuat::IDENTITY, DVec3::X);
+
+        assert!(broadside > nose_first * 2.0);
+    }
+
+    #[test]
+    fn mach_uses_the_local_atmosphere_and_is_zero_in_vacuum() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        let body = body_definition("carapace");
+        let position = DVec3::Y * (body.radius + 5.0);
+        vessel.position = position.to_array();
+        vessel.velocity =
+            (ground_velocity(position, body.rotation_period) + DVec3::X * 343.0).to_array();
+        let sea_level = telemetry(&vessel, &catalog, 0.0, 0.0);
+        assert_abs_diff_eq!(sea_level.mach, 1.0, epsilon = 0.01);
+
+        vessel.position = (DVec3::Y * (body.radius + HOME_ATMOSPHERE + 1.0)).to_array();
+        let vacuum = telemetry(&vessel, &catalog, 0.0, 0.0);
+        assert_eq!(vacuum.mach, 0.0);
+    }
+
+    #[test]
+    fn touchdown_depends_on_attitude_and_landing_legs() {
+        let catalog = PartCatalog::default();
+        let pod_craft = CraftBlueprint {
+            schema_version: 1,
+            name: "Bare pod".into(),
+            parts: vec![part(1, "pod_1", [0.0, 0.0, 0.0])],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let bare = Vessel::from_blueprint(&pod_craft, &catalog);
+        let radial = DVec3::Y;
+        let impact = -radial * 12.0;
+        assert!(touchdown_is_survivable(
+            &bare,
+            &catalog,
+            DQuat::IDENTITY,
+            radial,
+            impact,
+        ));
+        assert!(!touchdown_is_survivable(
+            &bare,
+            &catalog,
+            DQuat::from_rotation_z(PI * 0.5),
+            radial,
+            impact,
+        ));
+
+        let legged_craft = CraftBlueprint {
+            parts: vec![
+                part(1, "pod_1", [0.0, 0.0, 0.0]),
+                part(2, "landing_leg", [1.0, -1.0, 0.0]),
+                part(3, "landing_leg", [-1.0, -1.0, 0.0]),
+                part(4, "landing_leg", [0.0, -1.0, 1.0]),
+            ],
+            name: "Legged pod".into(),
+            ..pod_craft
+        };
+        let legged = Vessel::from_blueprint(&legged_craft, &catalog);
+        let fast_impact = -radial * 22.0;
+        assert!(!touchdown_is_survivable(
+            &bare,
+            &catalog,
+            DQuat::IDENTITY,
+            radial,
+            fast_impact,
+        ));
+        assert!(touchdown_is_survivable(
+            &legged,
+            &catalog,
+            DQuat::IDENTITY,
+            radial,
+            fast_impact,
+        ));
     }
 }
