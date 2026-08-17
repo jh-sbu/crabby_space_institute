@@ -3,15 +3,23 @@ name = "crabby_space_institute"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+mcp = ["dep:axum", "dep:rmcp", "dep:schemars", "dep:tokio"]
+
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8", optional = true }
 bevy = "0.19"
 bevy_egui = "0.41"
 directories = "6"
 mlua = { version = "0.12", features = ["lua54", "vendored", "serde", "send"] }
+rmcp = { version = "3.0.1", features = ["macros", "schemars", "server", "transport-streamable-http-server"], optional = true }
 ron = "0.12"
+schemars = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time"], optional = true }
 
 [dev-dependencies]
 approx = "0.5"

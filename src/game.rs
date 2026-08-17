@@ -21,7 +21,13 @@ use crate::simulation::{
     on_rails_warp_is_safe, step_on_rails_patched, step_vessel, telemetry, update_mission,
 };
 
-#[derive(States, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg(feature = "mcp")]
+mod mcp;
+
+#[derive(
+    States, Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 enum AppMode {
     #[default]
     Menu,
@@ -108,38 +114,40 @@ struct PartVisual {
 }
 
 pub fn run() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Crabby Space Institute".into(),
-                resolution: (1440, 900).into(),
-                resizable: true,
-                ..default()
-            }),
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "Crabby Space Institute".into(),
+            resolution: (1440, 900).into(),
+            resizable: true,
             ..default()
-        }))
-        .add_plugins(EguiPlugin::default())
-        .insert_resource(ClearColor(Color::srgb(0.004, 0.008, 0.02)))
-        .insert_resource(Time::<Fixed>::from_hz(60.0))
-        .insert_resource(Catalog(PartCatalog::default()))
-        .insert_resource(Store(SaveStore::default()))
-        .init_resource::<Session>()
-        .init_resource::<EditorState>()
-        .init_resource::<ViewState>()
-        .init_resource::<SimulationClock>()
-        .init_resource::<ScriptRuntime>()
-        .init_state::<AppMode>()
-        .add_systems(Startup, setup_world)
-        .add_systems(
-            Update,
-            (flight_input, rebuild_visuals, update_visuals, draw_orbits).chain(),
-        )
-        .add_systems(
-            FixedUpdate,
-            simulate_flight.run_if(in_state(AppMode::Flight)),
-        )
-        .add_systems(EguiPrimaryContextPass, game_ui)
-        .run();
+        }),
+        ..default()
+    }))
+    .add_plugins(EguiPlugin::default())
+    .insert_resource(ClearColor(Color::srgb(0.004, 0.008, 0.02)))
+    .insert_resource(Time::<Fixed>::from_hz(60.0))
+    .insert_resource(Catalog(PartCatalog::default()))
+    .insert_resource(Store(SaveStore::default()))
+    .init_resource::<Session>()
+    .init_resource::<EditorState>()
+    .init_resource::<ViewState>()
+    .init_resource::<SimulationClock>()
+    .init_resource::<ScriptRuntime>()
+    .init_state::<AppMode>()
+    .add_systems(Startup, setup_world)
+    .add_systems(
+        Update,
+        (flight_input, rebuild_visuals, update_visuals, draw_orbits).chain(),
+    )
+    .add_systems(
+        FixedUpdate,
+        simulate_flight.run_if(in_state(AppMode::Flight)),
+    )
+    .add_systems(EguiPrimaryContextPass, game_ui);
+    #[cfg(feature = "mcp")]
+    app.add_plugins(mcp::GameMcpPlugin);
+    app.run();
 }
 
 fn setup_world(

@@ -73,3 +73,15 @@ cargo test --all-targets
 ```
 
 The simulation library uses `f64` state vectors independently of rendering. Active craft run fixed-step compound-rigid-body physics; safe high warp uses universal-variable Kepler propagation and transforms state continuously when entering or leaving a body's sphere of influence.
+
+### Development MCP
+
+An optional, local-only MCP server can inspect and mutate live game state for debugging:
+
+```bash
+cargo run --features mcp
+```
+
+While that build is running, connect an MCP client to `http://127.0.0.1:8765/mcp`. The server exposes `inspect_game_state` and `patch_game_state`; patches use JSON Merge Patch semantics and are applied atomically on Bevy's update loop. Set `CRABBY_MCP_ADDR` to choose another loopback address. The server refuses non-loopback binds.
+
+The MCP code and its networking dependencies are excluded unless the `mcp` feature is enabled.
