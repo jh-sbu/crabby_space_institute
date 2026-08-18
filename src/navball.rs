@@ -117,7 +117,7 @@ fn maneuver_direction(vessel: &Vessel, universal_time: f64) -> Option<DVec3> {
     let body = body_definition(&vessel.primary_body);
     let dt = (node.ut - universal_time).max(0.0);
     let (position, velocity) =
-        propagate_universal(vessel.position_vec(), vessel.velocity_vec(), body.mu, dt);
+        propagate_universal(vessel.position_vec(), vessel.velocity_vec(), body.mu, dt).ok()?;
     let prograde = velocity.normalize_or_zero();
     let normal = position.cross(velocity).normalize_or_zero();
     let radial = position.normalize_or_zero();

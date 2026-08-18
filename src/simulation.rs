@@ -9,8 +9,8 @@ use crate::model::{
     PartModule, SasMode, StageAction, Vessel,
 };
 use crate::orbit::{
-    CelestialBodyDef, OrbitalElements, body_definition, celestial_system, circular_ephemeris,
-    elements, propagate_universal, sphere_of_influence,
+    CelestialBodyDef, KeplerError, OrbitalElements, body_definition, celestial_system,
+    circular_ephemeris, elements, propagate_universal, sphere_of_influence, vessel_root_state,
 };
 
 const G0: f64 = 9.80665;
@@ -20,6 +20,7 @@ const SOI_RELEASE_FACTOR: f64 = 1.01;
 const SOI_SWEEP_SEGMENT_FRACTION: f64 = 0.25;
 const SOI_SWEEP_MAX_SEGMENTS: usize = 4_096;
 const MAX_SOI_TRANSITIONS_PER_STEP: usize = 8;
+const DEBRIS_CLEANUP_DISTANCE: f64 = 10_000.0;
 const HEAT_CAPACITY_RATIO: f64 = 1.4;
 const UPRIGHT_VERTICAL_IMPACT_LIMIT: f64 = 18.0;
 const BROADSIDE_VERTICAL_IMPACT_LIMIT: f64 = 8.0;
@@ -1307,22 +1308,35 @@ pub fn step_vessel(
     vessel.velocity = velocity.to_array();
     vessel.attitude = [attitude.x, attitude.y, attitude.z, attitude.w];
     vessel.angular_velocity = angular_velocity.to_array();
-    step_debris(vessel, dt);
+    step_debris(vessel, dt, ut + dt);
     apply_soi_transitions(vessel, ut + dt);
     telemetry(vessel, catalog, ut + dt, total_thrust)
 }
 
-fn step_debris(vessel: &mut Vessel, dt: f64) {
-    for debris in &mut vessel.debris {
+fn step_debris(vessel: &mut Vessel, dt: f64, ut: f64) {
+    let (vessel_root_position, _) = vessel_root_state(
+        &vessel.primary_body,
+        vessel.position_vec(),
+        vessel.velocity_vec(),
+        ut,
+    );
+    vessel.debris.retain_mut(|debris| {
         let body = body_definition(&debris.primary_body);
         let mut position = debris.position_vec();
         let mut velocity = debris.velocity_vec();
-        let radial = position.normalize_or_zero();
-        velocity += -body.mu / position.length_squared().max(1.0) * radial * dt;
-        position += velocity * dt;
-        if position.length() <= body.radius + 5.0 {
-            position = position.normalize_or_zero() * (body.radius + 5.0);
+        if debris_is_distant(vessel_root_position, debris, ut)
+            && trajectory_reaches_cleanup_boundary(position, velocity, &body, dt)
+        {
+            return false;
+        }
+
+        if trajectory_reaches_radius(position, velocity, &body, body.radius + 5.0, dt) {
+            position = surface_position(position, &body);
             velocity = ground_velocity(position, body.rotation_period);
+        } else {
+            let radial = position.normalize_or_zero();
+            velocity += -body.mu / position.length_squared().max(1.0) * radial * dt;
+            position += velocity * dt;
         }
 
         let angular_velocity = DVec3::from_array(debris.angular_velocity);
@@ -1335,31 +1349,85 @@ fn step_debris(vessel: &mut Vessel, dt: f64) {
         debris.position = position.to_array();
         debris.velocity = velocity.to_array();
         debris.attitude = attitude.to_array();
-    }
+        !(debris_is_distant(vessel_root_position, debris, ut)
+            && position.length() <= cleanup_radius(&body))
+    });
 }
 
 pub fn step_on_rails(vessel: &mut Vessel, dt: f64) {
+    step_on_rails_at(vessel, 0.0, dt);
+}
+
+fn step_on_rails_at(vessel: &mut Vessel, ut: f64, dt: f64) {
     if matches!(vessel.situation, FlightSituation::Crashed) {
         return;
     }
     let body = body_definition(&vessel.primary_body);
     let surface_encountered =
         trajectory_reaches_surface(vessel.position_vec(), vessel.velocity_vec(), &body, dt);
-    let (position, velocity) =
-        propagate_universal(vessel.position_vec(), vessel.velocity_vec(), body.mu, dt);
+    if surface_encountered {
+        crash_vessel(vessel);
+        return;
+    }
+    let start_root_position = vessel_root_state(
+        &vessel.primary_body,
+        vessel.position_vec(),
+        vessel.velocity_vec(),
+        ut,
+    )
+    .0;
+    let Ok((position, velocity)) =
+        propagate_universal(vessel.position_vec(), vessel.velocity_vec(), body.mu, dt)
+    else {
+        crash_vessel(vessel);
+        return;
+    };
     vessel.position = position.to_array();
     vessel.velocity = velocity.to_array();
-    for debris in &mut vessel.debris {
+    let end_root_position = vessel_root_state(
+        &vessel.primary_body,
+        vessel.position_vec(),
+        vessel.velocity_vec(),
+        ut + dt,
+    )
+    .0;
+    vessel.debris.retain_mut(|debris| {
         let debris_body = body_definition(&debris.primary_body);
-        let (position, velocity) = propagate_universal(
+        if debris_is_distant(start_root_position, debris, ut)
+            && trajectory_reaches_cleanup_boundary(
+                debris.position_vec(),
+                debris.velocity_vec(),
+                &debris_body,
+                dt,
+            )
+        {
+            return false;
+        }
+        if trajectory_reaches_radius(
+            debris.position_vec(),
+            debris.velocity_vec(),
+            &debris_body,
+            debris_body.radius + 5.0,
+            dt,
+        ) {
+            let position = surface_position(debris.position_vec(), &debris_body);
+            debris.position = position.to_array();
+            debris.velocity = ground_velocity(position, debris_body.rotation_period).to_array();
+            return true;
+        }
+        let Ok((position, velocity)) = propagate_universal(
             debris.position_vec(),
             debris.velocity_vec(),
             debris_body.mu,
             dt,
-        );
+        ) else {
+            return false;
+        };
         debris.position = position.to_array();
         debris.velocity = velocity.to_array();
-    }
+        !(debris_is_distant(end_root_position, debris, ut + dt)
+            && position.length() <= cleanup_radius(&debris_body))
+    });
     update_on_rails_situation(vessel, surface_encountered);
 }
 
@@ -1373,20 +1441,26 @@ pub fn step_on_rails_patched(vessel: &mut Vessel, ut: f64, dt: f64) {
         }
 
         let current = body_definition(&vessel.primary_body);
-        let transition = next_soi_transition(
+        let transition = match next_soi_transition(
             vessel.position_vec(),
             vessel.velocity_vec(),
             &current,
             ut + elapsed,
             remaining,
-        );
+        ) {
+            Ok(transition) => transition,
+            Err(_) => {
+                crash_vessel(vessel);
+                return;
+            }
+        };
         let Some((transition_time, target, entering)) = transition else {
-            step_on_rails(vessel, remaining);
+            step_on_rails_at(vessel, ut + elapsed, remaining);
             elapsed = dt;
             break;
         };
 
-        step_on_rails(vessel, transition_time);
+        step_on_rails_at(vessel, ut + elapsed, transition_time);
         if matches!(vessel.situation, FlightSituation::Crashed) {
             return;
         }
@@ -1408,7 +1482,7 @@ pub fn step_on_rails_patched(vessel: &mut Vessel, ut: f64, dt: f64) {
         elapsed += transition_time;
     }
     if elapsed < dt && !matches!(vessel.situation, FlightSituation::Crashed) {
-        step_on_rails(vessel, dt - elapsed);
+        step_on_rails_at(vessel, ut + elapsed, dt - elapsed);
     }
     if matches!(vessel.situation, FlightSituation::Crashed) {
         return;
@@ -1439,16 +1513,18 @@ fn next_soi_transition(
     current: &CelestialBodyDef,
     ut: f64,
     dt: f64,
-) -> Option<(f64, CelestialBodyDef, bool)> {
-    let entering = first_child_soi_encounter(position, velocity, current, ut, dt)
+) -> Result<Option<(f64, CelestialBodyDef, bool)>, KeplerError> {
+    let entering = first_child_soi_encounter(position, velocity, current, ut, dt)?
         .map(|(time, child)| (time, child, true));
-    let exiting = current.parent.and_then(|parent_id| {
+    let exiting = if let Some(parent_id) = current.parent {
         let parent = body_definition(parent_id);
-        current_soi_exit_time(position, velocity, current, &parent, dt)
+        current_soi_exit_time(position, velocity, current, &parent, dt)?
             .map(|time| (time, parent, false))
-    });
+    } else {
+        None
+    };
 
-    match (entering, exiting) {
+    Ok(match (entering, exiting) {
         (Some(entering), Some(exiting)) => Some(if entering.0 <= exiting.0 {
             entering
         } else {
@@ -1457,7 +1533,7 @@ fn next_soi_transition(
         (Some(entering), None) => Some(entering),
         (None, Some(exiting)) => Some(exiting),
         (None, None) => None,
-    }
+    })
 }
 
 fn first_child_soi_encounter(
@@ -1466,19 +1542,23 @@ fn first_child_soi_encounter(
     current: &CelestialBodyDef,
     ut: f64,
     dt: f64,
-) -> Option<(f64, CelestialBodyDef)> {
+) -> Result<Option<(f64, CelestialBodyDef)>, KeplerError> {
     if dt <= 0.0 {
-        return None;
+        return Ok(None);
     }
 
-    celestial_system()
+    let mut earliest: Option<(f64, CelestialBodyDef)> = None;
+    for child in celestial_system()
         .into_iter()
         .filter(|body| body.parent == Some(current.id))
-        .filter_map(|child| {
-            child_soi_encounter_time(position, velocity, current, &child, ut, dt)
-                .map(|time| (time, child))
-        })
-        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+    {
+        if let Some(time) = child_soi_encounter_time(position, velocity, current, &child, ut, dt)?
+            && earliest.as_ref().is_none_or(|(best, _)| time < *best)
+        {
+            earliest = Some((time, child));
+        }
+    }
+    Ok(earliest)
 }
 
 fn child_soi_encounter_time(
@@ -1488,23 +1568,23 @@ fn child_soi_encounter_time(
     child: &CelestialBodyDef,
     ut: f64,
     dt: f64,
-) -> Option<f64> {
+) -> Result<Option<f64>, KeplerError> {
     let soi = sphere_of_influence(child.semi_major_axis, child.mu, current.mu) * SOI_CAPTURE_FACTOR;
     let relative_state_at = |elapsed: f64| {
         let (vessel_position, vessel_velocity) =
-            propagate_universal(position, velocity, current.mu, elapsed);
+            propagate_universal(position, velocity, current.mu, elapsed)?;
         let (child_position, child_velocity) = circular_ephemeris(child, current.mu, ut + elapsed);
-        (
+        Ok((
             vessel_position - child_position,
             vessel_velocity - child_velocity,
-        )
+        ))
     };
 
-    let (mut previous_position, start_velocity) = relative_state_at(0.0);
+    let (mut previous_position, start_velocity) = relative_state_at(0.0)?;
     if previous_position.length() < soi {
-        return Some(0.0);
+        return Ok(Some(0.0));
     }
-    let (_, end_velocity) = relative_state_at(dt);
+    let (_, end_velocity) = relative_state_at(dt)?;
     let estimated_travel = start_velocity.length().max(end_velocity.length()) * dt;
     let segment_length = soi * SOI_SWEEP_SEGMENT_FRACTION;
     let segments =
@@ -1513,34 +1593,34 @@ fn child_soi_encounter_time(
     let mut previous_time = 0.0;
     for index in 1..=segments {
         let time = dt * index as f64 / segments as f64;
-        let (relative_position, _) = relative_state_at(time);
+        let (relative_position, _) = relative_state_at(time)?;
 
         // The chord is a cheap broad phase. Its closest point also catches a
         // complete outside-to-outside crossing, unlike endpoint sampling.
         if segment_distance_to_origin(previous_position, relative_position) < soi * 1.1 {
-            let closest_time = minimize_distance(previous_time, time, &relative_state_at);
-            if relative_state_at(closest_time).0.length() < soi {
+            let closest_time = minimize_distance(previous_time, time, &relative_state_at)?;
+            if relative_state_at(closest_time)?.0.length() < soi {
                 let mut outside = previous_time;
                 let mut inside = closest_time;
-                if relative_state_at(outside).0.length() < soi {
-                    return Some(outside);
+                if relative_state_at(outside)?.0.length() < soi {
+                    return Ok(Some(outside));
                 }
                 for _ in 0..48 {
                     let midpoint = (outside + inside) * 0.5;
-                    if relative_state_at(midpoint).0.length() < soi {
+                    if relative_state_at(midpoint)?.0.length() < soi {
                         inside = midpoint;
                     } else {
                         outside = midpoint;
                     }
                 }
-                return Some(inside);
+                return Ok(Some(inside));
             }
         }
 
         previous_time = time;
         previous_position = relative_position;
     }
-    None
+    Ok(None)
 }
 
 fn current_soi_exit_time(
@@ -1549,19 +1629,19 @@ fn current_soi_exit_time(
     current: &CelestialBodyDef,
     parent: &CelestialBodyDef,
     dt: f64,
-) -> Option<f64> {
+) -> Result<Option<f64>, KeplerError> {
     let soi =
         sphere_of_influence(current.semi_major_axis, current.mu, parent.mu) * SOI_RELEASE_FACTOR;
     if position.length() > soi {
-        return Some(0.0);
+        return Ok(Some(0.0));
     }
 
     let orbit = elements(position, velocity, current.mu, 0.0);
     if orbit.apoapsis.is_finite() && orbit.apoapsis <= soi {
-        return None;
+        return Ok(None);
     }
 
-    let (_, end_velocity) = propagate_universal(position, velocity, current.mu, dt);
+    let (_, end_velocity) = propagate_universal(position, velocity, current.mu, dt)?;
     let estimated_travel = velocity.length().max(end_velocity.length()) * dt;
     let segment_length = soi * SOI_SWEEP_SEGMENT_FRACTION;
     let segments =
@@ -1570,13 +1650,13 @@ fn current_soi_exit_time(
 
     for index in 1..=segments {
         let time = dt * index as f64 / segments as f64;
-        let (next_position, _) = propagate_universal(position, velocity, current.mu, time);
+        let (next_position, _) = propagate_universal(position, velocity, current.mu, time)?;
         if next_position.length() > soi {
             let mut inside = previous_time;
             let mut outside = time;
             for _ in 0..48 {
                 let midpoint = (inside + outside) * 0.5;
-                if propagate_universal(position, velocity, current.mu, midpoint)
+                if propagate_universal(position, velocity, current.mu, midpoint)?
                     .0
                     .length()
                     > soi
@@ -1586,11 +1666,11 @@ fn current_soi_exit_time(
                     inside = midpoint;
                 }
             }
-            return Some(outside);
+            return Ok(Some(outside));
         }
         previous_time = time;
     }
-    None
+    Ok(None)
 }
 
 fn segment_distance_to_origin(start: DVec3, end: DVec3) -> f64 {
@@ -1605,20 +1685,20 @@ fn segment_distance_to_origin(start: DVec3, end: DVec3) -> f64 {
 fn minimize_distance(
     mut start: f64,
     mut end: f64,
-    relative_state_at: &impl Fn(f64) -> (DVec3, DVec3),
-) -> f64 {
+    relative_state_at: &impl Fn(f64) -> Result<(DVec3, DVec3), KeplerError>,
+) -> Result<f64, KeplerError> {
     for _ in 0..32 {
         let first = start + (end - start) / 3.0;
         let second = end - (end - start) / 3.0;
-        if relative_state_at(first).0.length_squared()
-            < relative_state_at(second).0.length_squared()
+        if relative_state_at(first)?.0.length_squared()
+            < relative_state_at(second)?.0.length_squared()
         {
             end = second;
         } else {
             start = first;
         }
     }
-    (start + end) * 0.5
+    Ok((start + end) * 0.5)
 }
 
 /// Whether the vessel can safely take another analytic high-warp step.
@@ -1688,33 +1768,80 @@ fn trajectory_reaches_surface(
     body: &CelestialBodyDef,
     dt: f64,
 ) -> bool {
-    if position.length() <= body.radius + 5.0 {
+    trajectory_reaches_radius(position, velocity, body, body.radius + 5.0, dt)
+}
+
+fn trajectory_reaches_cleanup_boundary(
+    position: DVec3,
+    velocity: DVec3,
+    body: &CelestialBodyDef,
+    dt: f64,
+) -> bool {
+    trajectory_reaches_radius(position, velocity, body, cleanup_radius(body), dt)
+}
+
+fn trajectory_reaches_radius(
+    position: DVec3,
+    velocity: DVec3,
+    body: &CelestialBodyDef,
+    radius: f64,
+    dt: f64,
+) -> bool {
+    if position.length() <= radius {
         return true;
     }
 
-    let orbit = elements(position, velocity, body.mu, body.radius);
-    if orbit.periapsis > 5.0 {
+    let orbit = elements(position, velocity, body.mu, 0.0);
+    if orbit.periapsis > radius {
         return false;
     }
 
     time_until_periapsis(position, velocity, body.mu).is_some_and(|time| time <= dt)
 }
 
+fn cleanup_radius(body: &CelestialBodyDef) -> f64 {
+    body.radius
+        + body
+            .atmosphere
+            .as_ref()
+            .map_or(5.0, |atmosphere| atmosphere.height)
+}
+
+fn debris_is_distant(vessel_root_position: DVec3, debris: &DetachedStage, ut: f64) -> bool {
+    let debris_root_position = vessel_root_state(
+        &debris.primary_body,
+        debris.position_vec(),
+        debris.velocity_vec(),
+        ut,
+    )
+    .0;
+    vessel_root_position.distance(debris_root_position) > DEBRIS_CLEANUP_DISTANCE
+}
+
+fn surface_position(position: DVec3, body: &CelestialBodyDef) -> DVec3 {
+    let direction = if position.is_finite() && position.length_squared() > f64::EPSILON {
+        position.normalize()
+    } else {
+        DVec3::Y
+    };
+    direction * (body.radius + 5.0)
+}
+
+fn crash_vessel(vessel: &mut Vessel) {
+    let body = body_definition(&vessel.primary_body);
+    let position = surface_position(vessel.position_vec(), &body);
+    vessel.position = position.to_array();
+    vessel.velocity = ground_velocity(position, body.rotation_period).to_array();
+    vessel.situation = FlightSituation::Crashed;
+}
+
 fn update_on_rails_situation(vessel: &mut Vessel, surface_encountered: bool) {
     let body = body_definition(&vessel.primary_body);
-    let mut position = vessel.position_vec();
+    let position = vessel.position_vec();
     let altitude = position.length() - body.radius;
 
     if surface_encountered || altitude <= 5.0 {
-        let surface_direction = if position.length_squared() > f64::EPSILON {
-            position.normalize()
-        } else {
-            DVec3::Y
-        };
-        position = surface_direction * (body.radius + 5.0);
-        vessel.position = position.to_array();
-        vessel.velocity = ground_velocity(position, body.rotation_period).to_array();
-        vessel.situation = FlightSituation::Crashed;
+        crash_vessel(vessel);
         return;
     }
 
@@ -1838,6 +1965,27 @@ mod tests {
             parent,
             local_position: position,
             local_rotation: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    fn orbiting_stock_vessel(radius: f64) -> Vessel {
+        let catalog = PartCatalog::default();
+        let body = body_definition("carapace");
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        vessel.position = (DVec3::X * radius).to_array();
+        vessel.velocity = (DVec3::Y * (body.mu / radius).sqrt()).to_array();
+        vessel.situation = FlightSituation::Orbiting;
+        vessel
+    }
+
+    fn debris(primary_body: &str, position: DVec3, velocity: DVec3) -> DetachedStage {
+        DetachedStage {
+            primary_body: primary_body.into(),
+            parts: Vec::new(),
+            position: position.to_array(),
+            velocity: velocity.to_array(),
+            attitude: DQuat::IDENTITY.to_array(),
+            angular_velocity: DVec3::ZERO.to_array(),
         }
     }
 
@@ -2582,13 +2730,14 @@ mod tests {
         let velocity = moon_velocity + DVec3::Z * speed;
 
         let (end_position, uninterrupted_velocity) =
-            propagate_universal(position, velocity, home.mu, dt);
+            propagate_universal(position, velocity, home.mu, dt).unwrap();
         let (end_moon_position, _) = circular_ephemeris(&moon, home.mu, dt);
         assert!(relative_position.length() > capture_radius);
         assert!((end_position - end_moon_position).length() > capture_radius);
 
-        let encounter =
-            child_soi_encounter_time(position, velocity, &home, &moon, 0.0, dt).unwrap();
+        let encounter = child_soi_encounter_time(position, velocity, &home, &moon, 0.0, dt)
+            .unwrap()
+            .unwrap();
         assert!(encounter > 0.0);
         assert!(encounter < dt);
 
@@ -2851,6 +3000,153 @@ mod tests {
         vessel.position = (DVec3::Y * (body.radius + HOME_ATMOSPHERE + 1.0)).to_array();
         let vacuum = telemetry(&vessel, &catalog, 0.0, 0.0);
         assert_eq!(vacuum.mach, 0.0);
+    }
+
+    #[test]
+    fn distant_debris_is_removed_when_it_enters_the_atmosphere() {
+        let body = body_definition("carapace");
+        let mut vessel = orbiting_stock_vessel(body.radius + 100_000.0);
+        let debris_radius = body.radius + HOME_ATMOSPHERE - 1.0;
+        vessel.debris.push(debris(
+            "carapace",
+            DVec3::X * debris_radius,
+            DVec3::Y * (body.mu / debris_radius).sqrt(),
+        ));
+
+        step_on_rails(&mut vessel, 1.0);
+
+        assert!(vessel.debris.is_empty());
+        assert_eq!(vessel.situation, FlightSituation::Orbiting);
+    }
+
+    #[test]
+    fn nearby_atmospheric_debris_is_retained_until_the_ship_moves_away() {
+        let body = body_definition("carapace");
+        let mut vessel = orbiting_stock_vessel(body.radius + 75_000.0);
+        let debris_radius = body.radius + HOME_ATMOSPHERE - 1.0;
+        vessel.debris.push(debris(
+            "carapace",
+            DVec3::X * debris_radius,
+            DVec3::Y * (body.mu / debris_radius).sqrt(),
+        ));
+
+        step_on_rails(&mut vessel, 1.0);
+        assert_eq!(vessel.debris.len(), 1);
+
+        vessel.position = (DVec3::X * (body.radius + 100_000.0)).to_array();
+        vessel.velocity = (DVec3::Y * (body.mu / (body.radius + 100_000.0)).sqrt()).to_array();
+        step_on_rails(&mut vessel, 1.0);
+        assert!(vessel.debris.is_empty());
+    }
+
+    #[test]
+    fn swept_cleanup_catches_an_outside_to_outside_atmosphere_crossing() {
+        let body = body_definition("carapace");
+        let mut vessel = orbiting_stock_vessel(body.radius + 75_000.0);
+        let apoapsis = body.radius + 200_000.0;
+        let periapsis = body.radius - 100_000.0;
+        let semi_major_axis = (apoapsis + periapsis) * 0.5;
+        let period = TAU * (semi_major_axis.powi(3) / body.mu).sqrt();
+        let velocity = (body.mu * (2.0 / apoapsis - 1.0 / semi_major_axis)).sqrt();
+        vessel
+            .debris
+            .push(debris("carapace", DVec3::X * apoapsis, DVec3::Y * velocity));
+
+        step_on_rails(&mut vessel, period);
+
+        assert!(vessel.debris.is_empty());
+        assert_eq!(vessel.situation, FlightSituation::Orbiting);
+    }
+
+    #[test]
+    fn fixed_step_removes_distant_atmospheric_debris() {
+        let catalog = PartCatalog::default();
+        let body = body_definition("carapace");
+        let mut vessel = orbiting_stock_vessel(body.radius + 100_000.0);
+        let debris_radius = body.radius + HOME_ATMOSPHERE - 1.0;
+        vessel.debris.push(debris(
+            "carapace",
+            DVec3::X * debris_radius,
+            DVec3::Y * (body.mu / debris_radius).sqrt(),
+        ));
+
+        step_vessel(&mut vessel, &catalog, 1.0 / 60.0, 0.0);
+
+        assert!(vessel.debris.is_empty());
+    }
+
+    #[test]
+    fn airless_surface_debris_uses_root_frame_cleanup_distance() {
+        let home = body_definition("carapace");
+        let moon = body_definition("selene");
+        let mut vessel = orbiting_stock_vessel(home.radius + 100_000.0);
+        vessel.debris.push(debris(
+            "selene",
+            DVec3::X * (moon.radius + 5.0),
+            DVec3::ZERO,
+        ));
+
+        step_on_rails(&mut vessel, 1.0);
+
+        assert!(vessel.debris.is_empty());
+    }
+
+    #[test]
+    fn failed_debris_propagation_removes_only_the_debris() {
+        let body = body_definition("carapace");
+        let mut vessel = orbiting_stock_vessel(body.radius + 75_000.0);
+        vessel.debris.push(debris(
+            "carapace",
+            DVec3::X * (body.radius + 76_000.0),
+            DVec3::splat(f64::NAN),
+        ));
+
+        step_on_rails(&mut vessel, 1.0);
+
+        assert!(vessel.debris.is_empty());
+        assert_eq!(vessel.situation, FlightSituation::Orbiting);
+    }
+
+    #[test]
+    fn failed_active_vessel_propagation_crashes_at_the_surface() {
+        let body = body_definition("carapace");
+        let mut vessel = orbiting_stock_vessel(body.radius + 75_000.0);
+        vessel.velocity = DVec3::splat(f64::NAN).to_array();
+
+        step_on_rails(&mut vessel, 1.0);
+
+        assert_eq!(vessel.situation, FlightSituation::Crashed);
+        assert_abs_diff_eq!(
+            vessel.position_vec().length(),
+            body.radius + 5.0,
+            epsilon = 1e-6
+        );
+        assert!(vessel.velocity_vec().is_finite());
+    }
+
+    #[test]
+    fn staged_debris_cleanup_stays_stable_over_several_high_warp_orbits() {
+        let body = body_definition("carapace");
+        let radius = body.radius + 75_000.0;
+        let mut vessel = orbiting_stock_vessel(radius);
+        vessel.debris.push(debris(
+            "carapace",
+            DVec3::X * (body.radius + HOME_ATMOSPHERE - 1.0),
+            DVec3::X * 0.001,
+        ));
+        let period = TAU * (radius.powi(3) / body.mu).sqrt();
+        let dt = SimulationClock::WARP_RATES[3] / 60.0;
+        let mut ut = 0.0;
+
+        for _ in 0..(period * 4.0 / dt).ceil() as usize {
+            step_on_rails_patched(&mut vessel, ut, dt);
+            ut += dt;
+        }
+
+        assert!(vessel.debris.is_empty());
+        assert_eq!(vessel.situation, FlightSituation::Orbiting);
+        assert!(vessel.position_vec().is_finite());
+        assert!(vessel.velocity_vec().is_finite());
     }
 
     #[test]

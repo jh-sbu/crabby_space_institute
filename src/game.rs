@@ -806,6 +806,7 @@ fn simulate_flight(
     {
         clock.warp_index = 0;
     }
+    let debris_before = vessel.debris.len();
     let rate = clock.rate();
     if rate <= 4.0 {
         let steps = rate as usize;
@@ -821,6 +822,9 @@ fn simulate_flight(
         if !on_rails_warp_is_safe(vessel) {
             clock.warp_index = clock.warp_index.min(2);
         }
+    }
+    if vessel.debris.len() != debris_before {
+        *visual_dirty = true;
     }
     update_mission(mission, vessel, current_telemetry);
     if vessel.situation == FlightSituation::Crashed {
@@ -914,28 +918,30 @@ fn draw_orbits(
         }
         if let Some(node) = &vessel.maneuver {
             let dt = (node.ut - clock.universal_time).max(0.0);
-            let (node_position, node_velocity) = crate::orbit::propagate_universal(
+            if let Ok((node_position, node_velocity)) = crate::orbit::propagate_universal(
                 vessel.position_vec(),
                 vessel.velocity_vec(),
                 body.mu,
                 dt,
-            );
-            let prograde = node_velocity.normalize_or_zero();
-            let normal = node_position.cross(node_velocity).normalize_or_zero();
-            let radial = node_position.normalize_or_zero();
-            let post_velocity = node_velocity
-                + prograde * node.prograde
-                + normal * node.normal
-                + radial * node.radial;
-            let post = sample_trajectory(node_position, post_velocity, body.mu, body.radius, 160)
-                .into_iter()
-                .map(|point| (point * scale).as_vec3());
-            gizmos.linestrip(post, Color::srgb(1.0, 0.45, 0.16));
-            gizmos.sphere(
-                (node_position * scale).as_vec3(),
-                0.08,
-                Color::srgb(1.0, 0.8, 0.2),
-            );
+            ) {
+                let prograde = node_velocity.normalize_or_zero();
+                let normal = node_position.cross(node_velocity).normalize_or_zero();
+                let radial = node_position.normalize_or_zero();
+                let post_velocity = node_velocity
+                    + prograde * node.prograde
+                    + normal * node.normal
+                    + radial * node.radial;
+                let post =
+                    sample_trajectory(node_position, post_velocity, body.mu, body.radius, 160)
+                        .into_iter()
+                        .map(|point| (point * scale).as_vec3());
+                gizmos.linestrip(post, Color::srgb(1.0, 0.45, 0.16));
+                gizmos.sphere(
+                    (node_position * scale).as_vec3(),
+                    0.08,
+                    Color::srgb(1.0, 0.8, 0.2),
+                );
+            }
         }
     }
 }

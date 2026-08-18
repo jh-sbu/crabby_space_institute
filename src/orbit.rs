@@ -1,6 +1,7 @@
 use bevy::math::DVec3;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
+use std::fmt;
 
 use crate::model::{HOME_ATMOSPHERE, HOME_MU, HOME_RADIUS};
 
@@ -150,6 +151,25 @@ pub struct OrbitalElements {
     pub specific_energy: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeplerError {
+    InvalidState,
+    FailedToConverge,
+}
+
+impl fmt::Display for KeplerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidState => formatter.write_str("invalid state for Kepler propagation"),
+            Self::FailedToConverge => {
+                formatter.write_str("universal-variable Kepler solver failed to converge")
+            }
+        }
+    }
+}
+
+impl std::error::Error for KeplerError {}
+
 pub fn elements(position: DVec3, velocity: DVec3, mu: f64, body_radius: f64) -> OrbitalElements {
     let r = position.length();
     let v2 = velocity.length_squared();
@@ -251,7 +271,7 @@ fn solve_universal_anomaly(
     mu: f64,
     dt: f64,
     alpha: f64,
-) -> Option<f64> {
+) -> Result<f64, KeplerError> {
     const MAX_ITERATIONS: usize = 64;
     const RELATIVE_STEP_TOLERANCE: f64 = 1e-12;
 
@@ -270,31 +290,44 @@ fn solve_universal_anomaly(
             r0 * vr0 / sqrt_mu * x * (1.0 - z * s) + (1.0 - alpha * r0) * x * x * c + r0;
         let dx = value / derivative;
         if !dx.is_finite() {
-            return None;
+            return Err(KeplerError::FailedToConverge);
         }
 
         x -= dx;
         if !x.is_finite() {
-            return None;
+            return Err(KeplerError::FailedToConverge);
         }
         if dx.abs() <= RELATIVE_STEP_TOLERANCE * (1.0 + x.abs()) {
-            return Some(x);
+            return Ok(x);
         }
     }
 
-    None
+    Err(KeplerError::FailedToConverge)
 }
 
 /// Propagate a two-body state with the universal-variable f/g solution.
-pub fn propagate_universal(position: DVec3, velocity: DVec3, mu: f64, dt: f64) -> (DVec3, DVec3) {
-    if dt.abs() < f64::EPSILON {
-        return (position, velocity);
-    }
+pub fn propagate_universal(
+    position: DVec3,
+    velocity: DVec3,
+    mu: f64,
+    dt: f64,
+) -> Result<(DVec3, DVec3), KeplerError> {
     let r0 = position.length();
+    if !position.is_finite()
+        || !velocity.is_finite()
+        || !mu.is_finite()
+        || !dt.is_finite()
+        || mu <= 0.0
+        || r0 <= f64::EPSILON
+    {
+        return Err(KeplerError::InvalidState);
+    }
+    if dt.abs() < f64::EPSILON {
+        return Ok((position, velocity));
+    }
     let alpha = 2.0 / r0 - velocity.length_squared() / mu;
     let sqrt_mu = mu.sqrt();
-    let x = solve_universal_anomaly(position, velocity, mu, dt, alpha)
-        .expect("universal-variable Kepler solver failed to converge");
+    let x = solve_universal_anomaly(position, velocity, mu, dt, alpha)?;
 
     let z = alpha * x * x;
     let c = stumpff_c(z);
@@ -303,10 +336,16 @@ pub fn propagate_universal(position: DVec3, velocity: DVec3, mu: f64, dt: f64) -
     let g = dt - x * x * x / sqrt_mu * s;
     let next_position = f * position + g * velocity;
     let r = next_position.length();
+    if !next_position.is_finite() || r <= f64::EPSILON {
+        return Err(KeplerError::FailedToConverge);
+    }
     let fdot = sqrt_mu / (r * r0) * x * (z * s - 1.0);
     let gdot = 1.0 - x * x / r * c;
     let next_velocity = fdot * position + gdot * velocity;
-    (next_position, next_velocity)
+    if !next_velocity.is_finite() {
+        return Err(KeplerError::FailedToConverge);
+    }
+    Ok((next_position, next_velocity))
 }
 
 pub fn sample_trajectory(
@@ -318,18 +357,22 @@ pub fn sample_trajectory(
 ) -> Vec<DVec3> {
     let orbit = elements(position, velocity, mu, body_radius);
     let duration = orbit.period.unwrap_or(7_200.0).min(200_000.0);
-    (0..=count)
-        .map(|i| {
-            propagate_universal(
-                position,
-                velocity,
-                mu,
-                duration * i as f64 / count.max(1) as f64,
-            )
-            .0
-        })
-        .take_while(|p| p.length() >= body_radius)
-        .collect()
+    let mut points = Vec::with_capacity(count + 1);
+    for i in 0..=count {
+        let Ok((point, _)) = propagate_universal(
+            position,
+            velocity,
+            mu,
+            duration * i as f64 / count.max(1) as f64,
+        ) else {
+            break;
+        };
+        if point.length() < body_radius {
+            break;
+        }
+        points.push(point);
+    }
+    points
 }
 
 pub fn sphere_of_influence(semi_major_axis: f64, body_mu: f64, parent_mu: f64) -> f64 {
@@ -351,7 +394,8 @@ mod tests {
             DVec3::new(0.0, velocity, 0.0),
             HOME_MU,
             period,
-        );
+        )
+        .unwrap();
         assert_relative_eq!(p.x, radius, epsilon = 0.05);
         assert_relative_eq!(p.y, 0.0, epsilon = 0.05);
         assert_relative_eq!(v.y, velocity, epsilon = 1e-5);
@@ -388,7 +432,7 @@ mod tests {
 
             for dt in [2_000.0, 7_200.0, 30_000.0, 86_400.0] {
                 let (next_position, next_velocity) =
-                    propagate_universal(position, velocity, HOME_MU, dt);
+                    propagate_universal(position, velocity, HOME_MU, dt).unwrap();
                 let final_energy =
                     next_velocity.length_squared() * 0.5 - HOME_MU / next_position.length();
 
@@ -410,9 +454,9 @@ mod tests {
         let position = DVec3::X * radius;
         let velocity = DVec3::Y * (HOME_MU * 4.5 / radius).sqrt();
         let (later_position, later_velocity) =
-            propagate_universal(position, velocity, HOME_MU, 86_400.0);
+            propagate_universal(position, velocity, HOME_MU, 86_400.0).unwrap();
         let (restored_position, restored_velocity) =
-            propagate_universal(later_position, later_velocity, HOME_MU, -86_400.0);
+            propagate_universal(later_position, later_velocity, HOME_MU, -86_400.0).unwrap();
 
         assert_relative_eq!(restored_position.x, position.x, epsilon = 1e-5);
         assert_relative_eq!(restored_position.y, position.y, epsilon = 1e-5);
@@ -434,5 +478,37 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[1].length() >= pair[0].length())
         );
+    }
+
+    #[test]
+    fn invalid_state_returns_an_error_instead_of_panicking() {
+        assert_eq!(
+            propagate_universal(DVec3::ZERO, DVec3::ZERO, HOME_MU, 1.0),
+            Err(KeplerError::InvalidState)
+        );
+        assert_eq!(
+            propagate_universal(DVec3::X, DVec3::Y, f64::NAN, 1.0),
+            Err(KeplerError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn ill_conditioned_radial_orbit_returns_an_error_instead_of_panicking() {
+        let mut position = DVec3::Y * (HOME_RADIUS + 5.0);
+        let mut velocity = DVec3::X * 0.001;
+        let dt = 10.0 / 60.0;
+        let error =
+            (0..100_000).find_map(
+                |_| match propagate_universal(position, velocity, HOME_MU, dt) {
+                    Ok((next_position, next_velocity)) => {
+                        position = next_position;
+                        velocity = next_velocity;
+                        None
+                    }
+                    Err(error) => Some(error),
+                },
+            );
+
+        assert_eq!(error, Some(KeplerError::FailedToConverge));
     }
 }
