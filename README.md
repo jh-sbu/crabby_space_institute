@@ -28,6 +28,8 @@ The first build is large because Bevy and the vendored Lua 5.4 runtime compile l
 
 The stock `Crabitat Pathfinder` is ready to launch. The optional guided mission asks you to clear the tower, stage, establish a 75 km orbit around Carapace, reenter, and recover the command pod.
 
+The bottom-center navball remains available in camera and map views. It shows vessel attitude, surface or orbital speed, prograde/retrograde, normal/anti-normal, radial in/out, and maneuver guidance; select `SURFACE` or `ORBIT` above the instrument to change velocity reference.
+
 ## Lua flight computer
 
 Open the Lua editor in assembly or flight. A script uses either callbacks:

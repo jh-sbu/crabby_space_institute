@@ -11,6 +11,7 @@ use crate::model::{
     CraftBlueprint, FlightSituation, ManeuverNode, PartCatalog, PartCategory, PartInstance,
     PartModule, SasMode, Stage, StageAction, ValidationIssue, Vessel, stock_craft,
 };
+use crate::navball::NavReference;
 use crate::orbit::{
     body_definition, celestial_system, circular_ephemeris, sample_trajectory, vessel_root_state,
 };
@@ -98,6 +99,7 @@ struct ViewState {
     show_help: bool,
     show_script_console: bool,
     script_log: Vec<String>,
+    nav_reference: NavReference,
 }
 
 #[derive(Resource, Default)]
@@ -1575,6 +1577,8 @@ fn flight_ui(
                 ui.separator();
                 ui.label(egui::RichText::new(&session.notice).color(egui::Color32::LIGHT_BLUE));
             });
+
+        crate::navball::show(ctx, vessel, clock.universal_time, &mut view.nav_reference);
     }
 
     if view.map {
@@ -1716,6 +1720,8 @@ fn script_window(
 fn help_window(ctx: &egui::Context) {
     egui::Window::new("Pilot controls").show(ctx, |ui| {
         ui.monospace("W/S pitch     A/D yaw      Q/E roll\nShift/Ctrl throttle        Z/X full/cut\nSpace stage    T SAS       R RCS\nM map          C camera    ,/. time warp\nF5/F9 save/load            F8 stop Lua");
+        ui.separator();
+        ui.label("Navball: green velocity, purple normal, cyan radial, and gold maneuver markers. Select SURFACE or ORBIT above the ball to change the velocity reference.");
         ui.separator();
         ui.label("High warp is available only while coasting safely outside the atmosphere. Map trajectories are analytic two-body conics; atmospheric paths become approximate at the entry interface.");
     });
