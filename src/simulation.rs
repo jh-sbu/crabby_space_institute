@@ -308,6 +308,18 @@ pub struct CraftStats {
     pub center_of_thrust_y: f64,
 }
 
+/// Vacuum performance available during one staging interval.
+///
+/// Burn time is measured at full throttle. A stage without a powered interval
+/// (for example, a parachute-only stage) reports zero for both values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagePerformance {
+    pub stage_index: usize,
+    pub name: String,
+    pub vacuum_delta_v: f64,
+    pub burn_time: f64,
+}
+
 pub fn craft_stats(craft: &CraftBlueprint, catalog: &PartCatalog) -> CraftStats {
     let mut stats = CraftStats::default();
     let stats_vessel = Vessel::from_blueprint(craft, catalog);
@@ -539,7 +551,7 @@ fn liquid_fuel_available(vessel: &Vessel, catalog: &PartCatalog, network: &BTree
         .sum()
 }
 
-fn burn_vacuum_interval(vessel: &mut Vessel, catalog: &PartCatalog) -> Option<f64> {
+fn burn_vacuum_interval(vessel: &mut Vessel, catalog: &PartCatalog) -> Option<(f64, f64)> {
     let mut liquid_networks: BTreeMap<u64, (BTreeSet<u64>, f64, f64)> = BTreeMap::new();
     let mut solid_burns = Vec::new();
 
@@ -631,8 +643,75 @@ fn burn_vacuum_interval(vessel: &mut Vessel, catalog: &PartCatalog) -> Option<f6
         }
     }
     let final_mass = vessel_mass(vessel, catalog);
-    (initial_mass > final_mass && final_mass > 0.0)
-        .then_some(total_thrust / total_mass_flow * (initial_mass / final_mass).ln())
+    (initial_mass > final_mass && final_mass > 0.0).then_some((
+        total_thrust / total_mass_flow * (initial_mass / final_mass).ln(),
+        duration,
+    ))
+}
+
+/// Returns the full-throttle vacuum performance of each stage in a blueprint.
+pub fn craft_stage_performance(
+    craft: &CraftBlueprint,
+    catalog: &PartCatalog,
+) -> Vec<StagePerformance> {
+    remaining_stage_performance(&Vessel::from_blueprint(craft, catalog), catalog)
+}
+
+/// Returns remaining full-throttle vacuum performance from a live vessel state.
+///
+/// The vessel is cloned and staged to fuel exhaustion, so this calculation does
+/// not alter the simulation. An already activated stage receives the performance
+/// of its currently burning engines; spent stages remain in the result with zero
+/// remaining performance.
+pub fn remaining_stage_performance(
+    vessel: &Vessel,
+    catalog: &PartCatalog,
+) -> Vec<StagePerformance> {
+    let mut simulated = vessel.clone();
+    let mut stages: Vec<_> = simulated
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(stage_index, stage)| StagePerformance {
+            stage_index,
+            name: stage.name.clone(),
+            vacuum_delta_v: 0.0,
+            burn_time: 0.0,
+        })
+        .collect();
+    if stages.is_empty() {
+        return stages;
+    }
+
+    let add_interval = |stage: &mut StagePerformance, interval: (f64, f64)| {
+        stage.vacuum_delta_v += interval.0;
+        stage.burn_time += interval.1;
+    };
+
+    // When a stage is already active in flight, account for its remaining burn
+    // before simulating the next staging event.
+    if simulated.next_stage > 0
+        && let Some(interval) = burn_vacuum_interval(&mut simulated, catalog)
+    {
+        let active_index = (simulated.next_stage - 1).min(stages.len() - 1);
+        add_interval(&mut stages[active_index], interval);
+    }
+
+    while simulated.next_stage < simulated.stages.len() {
+        let stage_index = simulated.next_stage;
+        activate_next_stage(&mut simulated, catalog);
+        if let Some(interval) = burn_vacuum_interval(&mut simulated, catalog) {
+            add_interval(&mut stages[stage_index], interval);
+        }
+    }
+
+    // If the final stage has propulsion groups with different exhaustion times,
+    // retain all of them in the last stage's totals.
+    while let Some(interval) = burn_vacuum_interval(&mut simulated, catalog) {
+        let final_index = stages.len() - 1;
+        add_interval(&mut stages[final_index], interval);
+    }
+    stages
 }
 
 fn staged_vacuum_delta_v(craft: &CraftBlueprint, catalog: &PartCatalog) -> f64 {
@@ -663,12 +742,12 @@ fn staged_vacuum_delta_v(craft: &CraftBlueprint, catalog: &PartCatalog) -> f64 {
     if has_engine_actions {
         while vessel.next_stage < vessel.stages.len() {
             activate_next_stage(&mut vessel, catalog);
-            if let Some(interval_delta_v) = burn_vacuum_interval(&mut vessel, catalog) {
+            if let Some((interval_delta_v, _)) = burn_vacuum_interval(&mut vessel, catalog) {
                 delta_v += interval_delta_v;
             }
         }
     }
-    while let Some(interval_delta_v) = burn_vacuum_interval(&mut vessel, catalog) {
+    while let Some((interval_delta_v, _)) = burn_vacuum_interval(&mut vessel, catalog) {
         delta_v += interval_delta_v;
     }
     delta_v
@@ -1788,6 +1867,45 @@ mod tests {
             (2.1..=2.2).contains(&stats.sea_level_twr),
             "stock liftoff TWR was {}",
             stats.sea_level_twr
+        );
+    }
+
+    #[test]
+    fn stage_performance_breakdown_matches_total_delta_v() {
+        let catalog = PartCatalog::default();
+        let craft = stock_craft();
+        let stages = craft_stage_performance(&craft, &catalog);
+
+        assert_eq!(stages.len(), craft.stages.len());
+        assert!(stages[0].vacuum_delta_v > 0.0);
+        assert!(stages[0].burn_time > 0.0);
+        assert!(stages[1].vacuum_delta_v > 0.0);
+        assert!(stages[2].vacuum_delta_v > 0.0);
+        assert_eq!(stages[3].vacuum_delta_v, 0.0);
+        assert_eq!(stages[3].burn_time, 0.0);
+        assert_abs_diff_eq!(
+            stages.iter().map(|stage| stage.vacuum_delta_v).sum::<f64>(),
+            craft_stats(&craft, &catalog).vacuum_delta_v,
+            epsilon = 1e-9
+        );
+    }
+
+    #[test]
+    fn live_stage_performance_tracks_remaining_fuel() {
+        let catalog = PartCatalog::default();
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
+        activate_next_stage(&mut vessel, &catalog);
+        let before = remaining_stage_performance(&vessel, &catalog);
+
+        vessel.controls.throttle = 1.0;
+        step_vessel(&mut vessel, &catalog, 1.0, 0.0);
+        let after = remaining_stage_performance(&vessel, &catalog);
+
+        assert!(after[0].burn_time < before[0].burn_time);
+        assert!(after[0].vacuum_delta_v < before[0].vacuum_delta_v);
+        assert!(
+            after.iter().map(|stage| stage.burn_time).sum::<f64>()
+                < before.iter().map(|stage| stage.burn_time).sum::<f64>()
         );
     }
 

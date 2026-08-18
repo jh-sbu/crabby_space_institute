@@ -17,8 +17,9 @@ use crate::orbit::{
 use crate::save::{QuickSave, SAVE_SCHEMA, SaveStore};
 use crate::scripting::{COROUTINE_EXAMPLE, EXAMPLE_SCRIPT, ScriptRuntime};
 use crate::simulation::{
-    FlightTelemetry, MissionProgress, SimulationClock, activate_next_stage, craft_stats,
-    on_rails_warp_is_safe, step_on_rails_patched, step_vessel, telemetry, update_mission,
+    FlightTelemetry, MissionProgress, SimulationClock, activate_next_stage,
+    craft_stage_performance, craft_stats, on_rails_warp_is_safe, remaining_stage_performance,
+    step_on_rails_patched, step_vessel, telemetry, update_mission,
 };
 
 #[cfg(feature = "mcp")]
@@ -1203,6 +1204,8 @@ fn editor_ui(
                     });
             }
             ui.separator();
+            stage_performance_ui(ui, &craft_stage_performance(&session.craft, catalog), None);
+            ui.separator();
             if editor.loaded_crafts.is_empty() {
                 editor.loaded_crafts = store.list_crafts();
             }
@@ -1524,6 +1527,12 @@ fn flight_ui(
                     ui.small(format!("Next: {}", stage.name));
                 }
                 ui.separator();
+                stage_performance_ui(
+                    ui,
+                    &remaining_stage_performance(vessel, catalog),
+                    Some(vessel.next_stage),
+                );
+                ui.separator();
                 ui.heading("SAS target");
                 ui.horizontal_wrapped(|ui| {
                     for (label, mode) in [
@@ -1736,6 +1745,73 @@ fn telemetry_ui(ui: &mut egui::Ui, data: &FlightTelemetry) {
     value_row(ui, "Mass", format!("{:.2} t", data.mass / 1_000.0));
     value_row(ui, "Liquid fuel", format!("{:.0} kg", data.liquid_fuel));
     value_row(ui, "Solid fuel", format!("{:.0} kg", data.solid_fuel));
+}
+
+fn stage_performance_ui(
+    ui: &mut egui::Ui,
+    stages: &[crate::simulation::StagePerformance],
+    next_stage: Option<usize>,
+) {
+    ui.heading("Stage performance");
+    ui.small("Vacuum Δv · burn at full throttle");
+    if stages.is_empty() {
+        ui.label(egui::RichText::new("No stages configured").italics().weak());
+        return;
+    }
+
+    egui::Grid::new(ui.next_auto_id())
+        .num_columns(3)
+        .spacing([10.0, 3.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Stage");
+            ui.strong("Δv");
+            ui.strong("Burn");
+            ui.end_row();
+            for stage in stages {
+                let is_spent = next_stage.is_some_and(|next| stage.stage_index + 1 < next);
+                let is_active = next_stage
+                    .is_some_and(|next| next > 0 && stage.stage_index == next.saturating_sub(1));
+                let label = if is_active {
+                    format!("▶ {} {}", stage.stage_index + 1, stage.name)
+                } else {
+                    format!("{} {}", stage.stage_index + 1, stage.name)
+                };
+                if is_spent {
+                    ui.label(egui::RichText::new(label).weak());
+                    ui.monospace(egui::RichText::new("spent").weak());
+                    ui.monospace(egui::RichText::new("—").weak());
+                } else {
+                    ui.label(label);
+                    ui.monospace(format!("{:.0} m/s", stage.vacuum_delta_v));
+                    ui.monospace(burn_duration(stage.burn_time));
+                }
+                ui.end_row();
+            }
+        });
+    let total_delta_v: f64 = stages.iter().map(|stage| stage.vacuum_delta_v).sum();
+    let total_burn: f64 = stages.iter().map(|stage| stage.burn_time).sum();
+    ui.horizontal(|ui| {
+        ui.strong("Remaining");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.monospace(format!(
+                "{} · {:.0} m/s",
+                burn_duration(total_burn),
+                total_delta_v
+            ));
+        });
+    });
+}
+
+fn burn_duration(seconds: f64) -> String {
+    if seconds <= f64::EPSILON {
+        "—".into()
+    } else if seconds < 60.0 {
+        format!("{seconds:.1} s")
+    } else {
+        let minutes = (seconds / 60.0).floor();
+        format!("{minutes:.0}m {:02.0}s", seconds % 60.0)
+    }
 }
 
 fn value_row(ui: &mut egui::Ui, label: &str, value: String) {
