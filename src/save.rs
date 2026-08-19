@@ -176,9 +176,11 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("crabby-space-quick-test-{}", std::process::id()));
         let store = SaveStore::at(root.clone());
+        let mut vessel = Vessel::from_blueprint(&stock_craft(), &PartCatalog::default());
+        vessel.sas_target_attitude = Some([0.0, 0.0, 0.0, 1.0]);
         let save = QuickSave {
             schema_version: SAVE_SCHEMA,
-            vessel: Vessel::from_blueprint(&stock_craft(), &PartCatalog::default()),
+            vessel,
             clock: SimulationClock {
                 universal_time: 42.5,
                 warp_index: 2,
@@ -194,8 +196,27 @@ mod tests {
         store.save_quick(&save).unwrap();
         let loaded = store.load_quick().unwrap();
         assert_eq!(loaded.vessel.primary_body, "carapace");
+        assert_eq!(
+            loaded.vessel.sas_target_attitude,
+            Some([0.0, 0.0, 0.0, 1.0])
+        );
         assert_eq!(loaded.clock.universal_time, 42.5);
         assert_eq!(loaded.script_state.unwrap()["phase"], 2);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_vessel_without_sas_target_still_deserializes() {
+        let vessel = Vessel::from_blueprint(&stock_craft(), &PartCatalog::default());
+        let serialized =
+            ron::ser::to_string_pretty(&vessel, ron::ser::PrettyConfig::default()).unwrap();
+        let legacy = serialized
+            .lines()
+            .filter(|line| !line.contains("sas_target_attitude:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let loaded: Vessel = ron::from_str(&legacy).unwrap();
+        assert_eq!(loaded.sas_target_attitude, None);
     }
 }

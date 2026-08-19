@@ -29,6 +29,10 @@ const LANDING_LEG_VERTICAL_BONUS: f64 = 8.0;
 const LANDING_LEG_HORIZONTAL_BONUS: f64 = 3.0;
 const INLINE_COAXIAL_TOLERANCE: f64 = 0.05;
 const INLINE_AXIS_ALIGNMENT: f64 = 0.98;
+const SAS_PROPORTIONAL_GAIN: f64 = 1.8;
+const SAS_DAMPING_GAIN: f64 = 0.7;
+const SAS_MANUAL_RETARGET_THRESHOLD: f64 = 0.1;
+const MIN_GUIDANCE_SPEED_SQUARED: f64 = 0.25;
 
 fn aerodynamic_lift_force(
     forward: DVec3,
@@ -909,24 +913,165 @@ fn ground_velocity(position: DVec3, rotation_period: f64) -> DVec3 {
     }
 }
 
-fn sas_torque(
+pub(crate) fn sas_uses_surface_reference(vessel: &Vessel) -> bool {
+    let body = body_definition(&vessel.primary_body);
+    let altitude = vessel.position_vec().length() - body.radius;
+    matches!(
+        vessel.situation,
+        FlightSituation::Prelaunch | FlightSituation::Landed
+    ) || body
+        .atmosphere
+        .as_ref()
+        .is_some_and(|atmosphere| altitude < atmosphere.height)
+}
+
+fn automatic_guidance_velocity(vessel: &Vessel, position: DVec3, velocity: DVec3) -> DVec3 {
+    if sas_uses_surface_reference(vessel) {
+        let body = body_definition(&vessel.primary_body);
+        velocity - ground_velocity(position, body.rotation_period)
+    } else {
+        velocity
+    }
+}
+
+pub(crate) fn maneuver_direction(vessel: &Vessel, universal_time: f64) -> Option<DVec3> {
+    let node = vessel.maneuver.as_ref()?;
+    let body = body_definition(&vessel.primary_body);
+    let dt = (node.ut - universal_time).max(0.0);
+    let (position, velocity) =
+        propagate_universal(vessel.position_vec(), vessel.velocity_vec(), body.mu, dt).ok()?;
+    let prograde = velocity.normalize_or_zero();
+    let normal = position.cross(velocity).normalize_or_zero();
+    let radial = position.normalize_or_zero();
+    let burn = prograde * node.prograde + normal * node.normal + radial * node.radial;
+    (burn.length_squared() > f64::EPSILON).then(|| burn.normalize())
+}
+
+fn sas_direction_target(
     vessel: &Vessel,
-    attitude: DQuat,
+    universal_time: f64,
+    position: DVec3,
     velocity: DVec3,
     radial: DVec3,
-    available: f64,
-) -> DVec3 {
-    let local_forward = attitude * DVec3::Y;
-    let target = match vessel.controls.sas {
-        Some(SasMode::Prograde) if velocity.length_squared() > 1.0 => velocity.normalize(),
-        Some(SasMode::Retrograde) if velocity.length_squared() > 1.0 => -velocity.normalize(),
-        Some(SasMode::RadialOut) => radial,
-        Some(SasMode::RadialIn) => -radial,
-        Some(SasMode::Normal) => radial.cross(velocity).normalize_or_zero(),
-        Some(SasMode::AntiNormal) => -radial.cross(velocity).normalize_or_zero(),
-        _ => local_forward,
+) -> Option<DVec3> {
+    let reference_velocity = automatic_guidance_velocity(vessel, position, velocity);
+    match vessel.controls.sas? {
+        SasMode::Stability => None,
+        SasMode::Prograde if reference_velocity.length_squared() >= MIN_GUIDANCE_SPEED_SQUARED => {
+            Some(reference_velocity.normalize())
+        }
+        SasMode::Retrograde
+            if reference_velocity.length_squared() >= MIN_GUIDANCE_SPEED_SQUARED =>
+        {
+            Some(-reference_velocity.normalize())
+        }
+        SasMode::Normal => {
+            let normal = radial.cross(reference_velocity);
+            (normal.length_squared() > f64::EPSILON).then(|| normal.normalize())
+        }
+        SasMode::AntiNormal => {
+            let normal = radial.cross(reference_velocity);
+            (normal.length_squared() > f64::EPSILON).then(|| -normal.normalize())
+        }
+        SasMode::RadialIn => Some(-radial),
+        SasMode::RadialOut => Some(radial),
+        SasMode::Maneuver => maneuver_direction(vessel, universal_time),
+        SasMode::Prograde | SasMode::Retrograde => None,
+    }
+}
+
+fn clamp_unit(value: DVec3) -> DVec3 {
+    if value.length_squared() > 1.0 {
+        value.normalize()
+    } else {
+        value
+    }
+}
+
+fn direction_error(current: DVec3, target: DVec3, antipodal_axis: DVec3) -> DVec3 {
+    let current = current.normalize_or_zero();
+    let target = target.normalize_or_zero();
+    if current.length_squared() <= f64::EPSILON || target.length_squared() <= f64::EPSILON {
+        return DVec3::ZERO;
+    }
+    let dot = current.dot(target).clamp(-1.0, 1.0);
+    let angle = dot.acos();
+    if angle <= 1.0e-12 {
+        return DVec3::ZERO;
+    }
+    let cross = current.cross(target);
+    let axis = if cross.length_squared() > 1.0e-20 {
+        cross.normalize()
+    } else {
+        antipodal_axis.reject_from(current).normalize_or_zero()
     };
-    local_forward.cross(target) * available * 1.8
+    axis * angle
+}
+
+fn attitude_error(current: DQuat, target: DQuat) -> DVec3 {
+    let mut delta = (target * current.conjugate()).normalize();
+    if delta.w < 0.0 {
+        delta = DQuat::from_array(delta.to_array().map(|component| -component));
+    }
+    let (axis, angle) = delta.to_axis_angle();
+    if axis.is_finite() && angle.is_finite() {
+        axis * angle
+    } else {
+        DVec3::ZERO
+    }
+}
+
+fn stored_sas_attitude(vessel: &Vessel) -> Option<DQuat> {
+    let attitude = DQuat::from_array(vessel.sas_target_attitude?);
+    (attitude.is_finite() && attitude.length_squared() > f64::EPSILON).then(|| attitude.normalize())
+}
+
+fn control_torque_command(
+    vessel: &mut Vessel,
+    attitude: DQuat,
+    angular_velocity: DVec3,
+    position: DVec3,
+    velocity: DVec3,
+    available: f64,
+    universal_time: f64,
+) -> (DVec3, bool) {
+    let local_input = DVec3::new(
+        vessel.controls.pitch,
+        vessel.controls.roll,
+        -vessel.controls.yaw,
+    );
+    let manual_magnitude = local_input.length().min(1.0);
+    let manual_command = clamp_unit(local_input);
+    let manual_world_command = attitude * manual_command;
+    let Some(mode) = vessel.controls.sas else {
+        vessel.sas_target_attitude = None;
+        return (manual_world_command * available.max(0.0), false);
+    };
+
+    let manual_retarget =
+        mode == SasMode::Stability && manual_magnitude >= SAS_MANUAL_RETARGET_THRESHOLD;
+    let proportional_error = if mode == SasMode::Stability {
+        let target = if manual_retarget {
+            attitude
+        } else {
+            stored_sas_attitude(vessel).unwrap_or(attitude)
+        };
+        vessel.sas_target_attitude = Some(target.to_array());
+        attitude_error(attitude, target)
+    } else {
+        vessel.sas_target_attitude = None;
+        let radial = position.normalize_or_zero();
+        sas_direction_target(vessel, universal_time, position, velocity, radial)
+            .map_or(DVec3::ZERO, |target| {
+                direction_error(attitude * DVec3::Y, target, attitude * DVec3::X)
+            })
+    };
+    let sas_command = clamp_unit(
+        proportional_error * SAS_PROPORTIONAL_GAIN - angular_velocity * SAS_DAMPING_GAIN,
+    );
+    let combined_command =
+        clamp_unit(manual_world_command + sas_command * (1.0 - manual_magnitude));
+    (combined_command * available.max(0.0), manual_retarget)
 }
 
 fn touchdown_is_survivable(
@@ -1187,16 +1332,15 @@ pub fn step_vessel(
         }
     }
 
-    let local_input = DVec3::new(
-        vessel.controls.pitch,
-        vessel.controls.roll,
-        -vessel.controls.yaw,
+    let (applied_control_torque, recapture_sas_attitude) = control_torque_command(
+        vessel,
+        attitude,
+        angular_velocity,
+        position,
+        velocity,
+        control_torque,
+        ut,
     );
-    let mut applied_control_torque = attitude * local_input * control_torque;
-    if vessel.controls.sas.is_some() && local_input.length_squared() < 1e-4 {
-        applied_control_torque += sas_torque(vessel, attitude, velocity, radial, control_torque);
-        applied_control_torque -= angular_velocity * control_torque * 0.7;
-    }
     torque += applied_control_torque;
     if vessel.controls.rcs && rcs_available && rcs_mass_flow > 0.0 {
         let effort = (applied_control_torque.length() / control_torque.max(1.0)).clamp(0.0, 1.0);
@@ -1209,6 +1353,9 @@ pub fn step_vessel(
     if angle > 1e-12 {
         attitude =
             (DQuat::from_axis_angle(angular_velocity.normalize(), angle) * attitude).normalize();
+    }
+    if recapture_sas_attitude {
+        vessel.sas_target_attitude = Some(attitude.to_array());
     }
 
     let acceleration = -body.mu / position.length_squared().max(1.0) * radial + force / mass;
@@ -1356,6 +1503,40 @@ fn step_debris(vessel: &mut Vessel, dt: f64, ut: f64) {
 
 pub fn step_on_rails(vessel: &mut Vessel, dt: f64) {
     step_on_rails_at(vessel, 0.0, dt);
+    if !matches!(vessel.situation, FlightSituation::Crashed) {
+        apply_on_rails_sas(vessel, dt);
+    }
+}
+
+fn apply_on_rails_sas(vessel: &mut Vessel, universal_time: f64) {
+    let Some(mode) = vessel.controls.sas else {
+        vessel.sas_target_attitude = None;
+        return;
+    };
+    let attitude = vessel.attitude_quat().normalize();
+    let target_attitude = if mode == SasMode::Stability {
+        let target = stored_sas_attitude(vessel).unwrap_or(attitude);
+        vessel.sas_target_attitude = Some(target.to_array());
+        Some(target)
+    } else {
+        vessel.sas_target_attitude = None;
+        let position = vessel.position_vec();
+        let velocity = vessel.velocity_vec();
+        let radial = position.normalize_or_zero();
+        sas_direction_target(vessel, universal_time, position, velocity, radial).map(|target| {
+            let error = direction_error(attitude * DVec3::Y, target, attitude * DVec3::X);
+            let angle = error.length();
+            if angle > 1.0e-12 {
+                (DQuat::from_axis_angle(error / angle, angle) * attitude).normalize()
+            } else {
+                attitude
+            }
+        })
+    };
+    if let Some(target_attitude) = target_attitude {
+        vessel.attitude = target_attitude.to_array();
+    }
+    vessel.angular_velocity = [0.0; 3];
 }
 
 fn step_on_rails_at(vessel: &mut Vessel, ut: f64, dt: f64) {
@@ -1505,6 +1686,9 @@ pub fn step_on_rails_patched(vessel: &mut Vessel, ut: f64, dt: f64) {
         && vessel.position_vec().dot(vessel.velocity_vec()) > 0.0
         && orbit.periapsis <= 5.0;
     update_on_rails_situation(vessel, crossed_surface_during_capture);
+    if !matches!(vessel.situation, FlightSituation::Crashed) {
+        apply_on_rails_sas(vessel, ut + dt);
+    }
 }
 
 fn next_soi_transition(
@@ -1987,6 +2171,244 @@ mod tests {
             attitude: DQuat::IDENTITY.to_array(),
             angular_velocity: DVec3::ZERO.to_array(),
         }
+    }
+
+    fn controller_vessel() -> (PartCatalog, Vessel) {
+        let catalog = PartCatalog::default();
+        let craft = CraftBlueprint {
+            schema_version: 1,
+            name: "SAS controller test".into(),
+            parts: vec![part(1, "pod_1", [0.0, 0.0, 0.0])],
+            stages: Vec::new(),
+            crew: Vec::new(),
+            script_name: None,
+        };
+        let body = body_definition("carapace");
+        let mut vessel = Vessel::from_blueprint(&craft, &catalog);
+        vessel.position = (DVec3::X * (body.radius + HOME_ATMOSPHERE + 100_000.0)).to_array();
+        vessel.velocity = DVec3::Y.to_array();
+        vessel.situation = FlightSituation::Orbiting;
+        (catalog, vessel)
+    }
+
+    #[test]
+    fn sas_uses_surface_velocity_in_atmosphere_and_orbit_velocity_in_space() {
+        let (_, mut vessel) = controller_vessel();
+        let body = body_definition("carapace");
+        let low_position = DVec3::X * (body.radius + 7_000.0);
+        let ground = ground_velocity(low_position, body.rotation_period);
+        vessel.position = low_position.to_array();
+        vessel.velocity = (ground + DVec3::X * 250.0).to_array();
+        vessel.situation = FlightSituation::Flying;
+
+        assert!(sas_uses_surface_reference(&vessel));
+        assert!(
+            automatic_guidance_velocity(&vessel, low_position, vessel.velocity_vec())
+                .distance(DVec3::X * 250.0)
+                < 1.0e-9
+        );
+
+        let high_position = DVec3::X * (body.radius + HOME_ATMOSPHERE + 1.0);
+        vessel.position = high_position.to_array();
+        vessel.velocity =
+            (ground_velocity(high_position, body.rotation_period) + DVec3::X * 250.0).to_array();
+        assert!(!sas_uses_surface_reference(&vessel));
+        assert!(
+            automatic_guidance_velocity(&vessel, high_position, vessel.velocity_vec())
+                .distance(vessel.velocity_vec())
+                < 1.0e-9
+        );
+    }
+
+    #[test]
+    fn maneuver_sas_uses_the_planned_burn_direction() {
+        let (catalog, mut vessel) = controller_vessel();
+        vessel.controls.sas = Some(SasMode::Maneuver);
+        vessel.maneuver = Some(crate::model::ManeuverNode {
+            ut: 0.0,
+            prograde: 0.0,
+            normal: 0.0,
+            radial: 1.0,
+        });
+
+        step_vessel(&mut vessel, &catalog, 0.01, 0.0);
+
+        assert!(vessel.angular_velocity[2] < 0.0);
+    }
+
+    #[test]
+    fn sas_and_manual_commands_are_capped_at_rated_authority() {
+        let (_, mut vessel) = controller_vessel();
+        vessel.velocity = DVec3::X.to_array();
+        vessel.controls.sas = Some(SasMode::Prograde);
+        let attitude = DQuat::IDENTITY;
+        let position = vessel.position_vec();
+        let available = 8_000.0;
+        let (sas, _) = control_torque_command(
+            &mut vessel,
+            attitude,
+            DVec3::ZERO,
+            position,
+            DVec3::X,
+            available,
+            0.0,
+        );
+
+        vessel.controls.sas = None;
+        vessel.controls.yaw = 1.0;
+        let (manual, _) = control_torque_command(
+            &mut vessel,
+            attitude,
+            DVec3::ZERO,
+            position,
+            DVec3::X,
+            available,
+            0.0,
+        );
+
+        assert_abs_diff_eq!(sas.length(), available, epsilon = 1.0e-9);
+        assert_abs_diff_eq!(manual.length(), available, epsilon = 1.0e-9);
+    }
+
+    #[test]
+    fn sas_damping_is_bounded_at_extreme_spin_and_large_steps_stay_finite() {
+        let (catalog, mut vessel) = controller_vessel();
+        vessel.controls.sas = Some(SasMode::Stability);
+        let position = vessel.position_vec();
+        let velocity = vessel.velocity_vec();
+        let (command, _) = control_torque_command(
+            &mut vessel,
+            DQuat::IDENTITY,
+            DVec3::X * 100.0,
+            position,
+            velocity,
+            8_000.0,
+            0.0,
+        );
+        assert!(command.length() <= 8_000.0 + 1.0e-9);
+
+        vessel.angular_velocity = (DVec3::X * 100.0).to_array();
+        for step in 0..20 {
+            step_vessel(&mut vessel, &catalog, 4.0, f64::from(step) * 4.0);
+            assert!(vessel.angular_velocity_vec().is_finite());
+            assert!(vessel.attitude_quat().is_finite());
+            assert!(vessel.angular_velocity_vec().length() < 1_000.0);
+        }
+    }
+
+    #[test]
+    fn small_manual_input_no_longer_disables_sas() {
+        let (_, vessel) = controller_vessel();
+        let command_at = |yaw: f64| {
+            let mut vessel = vessel.clone();
+            vessel.velocity = DVec3::X.to_array();
+            vessel.controls.sas = Some(SasMode::Prograde);
+            vessel.controls.yaw = yaw;
+            let position = vessel.position_vec();
+            control_torque_command(
+                &mut vessel,
+                DQuat::IDENTITY,
+                DVec3::ZERO,
+                position,
+                DVec3::X,
+                8_000.0,
+                0.0,
+            )
+            .0
+        };
+        let below = command_at(0.009);
+        let above = command_at(0.011);
+
+        assert!(below.length() > 7_900.0);
+        assert!(above.length() > 7_900.0);
+        assert!((below - above).length() < 50.0);
+    }
+
+    #[test]
+    fn stability_holds_full_attitude_and_retargets_after_manual_rotation() {
+        let (catalog, mut vessel) = controller_vessel();
+        vessel.controls.sas = Some(SasMode::Stability);
+        step_vessel(&mut vessel, &catalog, 1.0 / 60.0, 0.0);
+        assert!(vessel.sas_target_attitude.is_some());
+
+        vessel.controls.yaw = 1.0;
+        for frame in 1..=30 {
+            step_vessel(&mut vessel, &catalog, 1.0 / 60.0, f64::from(frame) / 60.0);
+        }
+        let retargeted = stored_sas_attitude(&vessel).unwrap();
+        assert!(retargeted.dot(vessel.attitude_quat()).abs() > 1.0 - 1.0e-12);
+
+        vessel.controls.yaw = 0.0;
+        vessel.angular_velocity = [0.0; 3];
+        vessel.attitude = (DQuat::from_axis_angle(vessel.attitude_quat() * DVec3::Y, 0.2)
+            * vessel.attitude_quat())
+        .to_array();
+        let before = vessel.angular_velocity_vec();
+        step_vessel(&mut vessel, &catalog, 0.01, 1.0);
+        assert!(vessel.angular_velocity_vec().distance(before) > 0.0);
+    }
+
+    #[test]
+    fn exact_antipodal_target_produces_a_finite_correction() {
+        let (_, mut vessel) = controller_vessel();
+        vessel.controls.sas = Some(SasMode::Retrograde);
+        vessel.velocity = DVec3::Y.to_array();
+        let position = vessel.position_vec();
+        let (command, _) = control_torque_command(
+            &mut vessel,
+            DQuat::IDENTITY,
+            DVec3::ZERO,
+            position,
+            DVec3::Y,
+            8_000.0,
+            0.0,
+        );
+
+        assert!(command.is_finite());
+        assert_abs_diff_eq!(command.length(), 8_000.0, epsilon = 1.0e-9);
+    }
+
+    #[test]
+    fn on_rails_sas_tracks_the_propagated_target_and_stops_rotation() {
+        let body = body_definition("carapace");
+        let radius = body.radius + 100_000.0;
+        let mut vessel = orbiting_stock_vessel(radius);
+        vessel.controls.sas = Some(SasMode::Prograde);
+        vessel.attitude = DQuat::from_rotation_z(-PI * 0.5).to_array();
+        vessel.angular_velocity = [1.0, 2.0, 3.0];
+
+        step_on_rails(&mut vessel, 600.0);
+
+        let target = sas_direction_target(
+            &vessel,
+            600.0,
+            vessel.position_vec(),
+            vessel.velocity_vec(),
+            vessel.position_vec().normalize(),
+        )
+        .unwrap();
+        assert!((vessel.attitude_quat() * DVec3::Y).dot(target) > 1.0 - 1.0e-12);
+        assert_eq!(vessel.angular_velocity, [0.0; 3]);
+    }
+
+    #[test]
+    fn on_rails_maneuver_sas_uses_the_node_direction_at_the_end_time() {
+        let body = body_definition("carapace");
+        let radius = body.radius + 100_000.0;
+        let mut vessel = orbiting_stock_vessel(radius);
+        vessel.controls.sas = Some(SasMode::Maneuver);
+        vessel.maneuver = Some(crate::model::ManeuverNode {
+            ut: 1_200.0,
+            prograde: 20.0,
+            normal: 5.0,
+            radial: 10.0,
+        });
+
+        step_on_rails(&mut vessel, 600.0);
+
+        let target = maneuver_direction(&vessel, 600.0).unwrap();
+        assert!((vessel.attitude_quat() * DVec3::Y).dot(target) > 1.0 - 1.0e-12);
+        assert_eq!(vessel.angular_velocity, [0.0; 3]);
     }
 
     #[test]

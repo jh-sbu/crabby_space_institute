@@ -3,7 +3,8 @@ use bevy_egui::egui;
 use std::f64::consts::{PI, TAU};
 
 use crate::model::Vessel;
-use crate::orbit::{body_definition, propagate_universal};
+use crate::orbit::body_definition;
+use crate::simulation::maneuver_direction;
 
 const BALL_DIAMETER: f32 = 218.0;
 const BALL_RADIUS: f32 = BALL_DIAMETER * 0.5;
@@ -110,19 +111,6 @@ fn ground_velocity(position: DVec3, rotation_period: f64) -> DVec3 {
     } else {
         (DVec3::Z * (TAU / rotation_period)).cross(position)
     }
-}
-
-fn maneuver_direction(vessel: &Vessel, universal_time: f64) -> Option<DVec3> {
-    let node = vessel.maneuver.as_ref()?;
-    let body = body_definition(&vessel.primary_body);
-    let dt = (node.ut - universal_time).max(0.0);
-    let (position, velocity) =
-        propagate_universal(vessel.position_vec(), vessel.velocity_vec(), body.mu, dt).ok()?;
-    let prograde = velocity.normalize_or_zero();
-    let normal = position.cross(velocity).normalize_or_zero();
-    let radial = position.normalize_or_zero();
-    let burn = prograde * node.prograde + normal * node.normal + radial * node.radial;
-    (burn.length_squared() > f64::EPSILON).then(|| burn.normalize())
 }
 
 fn paint_navball(

@@ -20,7 +20,7 @@ use crate::scripting::{COROUTINE_EXAMPLE, EXAMPLE_SCRIPT, ScriptRuntime};
 use crate::simulation::{
     FlightTelemetry, MissionProgress, SimulationClock, activate_next_stage,
     craft_stage_performance, craft_stats, on_rails_warp_is_safe, remaining_stage_performance,
-    step_on_rails_patched, step_vessel, telemetry, update_mission,
+    sas_uses_surface_reference, step_on_rails_patched, step_vessel, telemetry, update_mission,
 };
 
 #[cfg(feature = "mcp")]
@@ -115,6 +115,19 @@ impl RemoteFlightInput {
         self.yaw = None;
         self.roll = None;
     }
+}
+
+fn resolved_attitude_controls(
+    keyboard_enabled: bool,
+    keyboard: [f64; 3],
+    remote: &RemoteFlightInput,
+) -> [f64; 3] {
+    let keyboard = if keyboard_enabled { keyboard } else { [0.0; 3] };
+    [
+        remote.pitch.unwrap_or(keyboard[0]),
+        remote.yaw.unwrap_or(keyboard[1]),
+        remote.roll.unwrap_or(keyboard[2]),
+    ]
 }
 
 #[derive(Component)]
@@ -554,7 +567,7 @@ fn flight_input(
     mut view: ResMut<ViewState>,
     mut remote_input: ResMut<RemoteFlightInput>,
 ) {
-    if *state.get() != AppMode::Flight || wants_input.wants_keyboard_input() {
+    if *state.get() != AppMode::Flight {
         return;
     }
     let Session {
@@ -570,15 +583,22 @@ fn flight_input(
     let axis = |negative: KeyCode, positive: KeyCode| {
         keys.pressed(positive) as i8 as f64 - keys.pressed(negative) as i8 as f64
     };
-    vessel.controls.pitch = remote_input
-        .pitch
-        .unwrap_or_else(|| axis(KeyCode::KeyS, KeyCode::KeyW));
-    vessel.controls.yaw = remote_input
-        .yaw
-        .unwrap_or_else(|| axis(KeyCode::KeyD, KeyCode::KeyA));
-    vessel.controls.roll = remote_input
-        .roll
-        .unwrap_or_else(|| axis(KeyCode::KeyE, KeyCode::KeyQ));
+    let keyboard_enabled = !wants_input.wants_keyboard_input();
+    let [pitch, yaw, roll] = resolved_attitude_controls(
+        keyboard_enabled,
+        [
+            axis(KeyCode::KeyS, KeyCode::KeyW),
+            axis(KeyCode::KeyD, KeyCode::KeyA),
+            axis(KeyCode::KeyE, KeyCode::KeyQ),
+        ],
+        &remote_input,
+    );
+    vessel.controls.pitch = pitch;
+    vessel.controls.yaw = yaw;
+    vessel.controls.roll = roll;
+    if !keyboard_enabled {
+        return;
+    }
     let throttle_delta =
         axis(KeyCode::ControlLeft, KeyCode::ShiftLeft) * time.delta_secs_f64() * 0.45;
     if throttle_delta != 0.0 {
@@ -1495,14 +1515,30 @@ fn flight_ui(
                 ui.separator();
                 telemetry_ui(ui, &session.telemetry);
                 ui.separator();
-                ui.label(format!(
-                    "SAS: {}",
-                    vessel
-                        .controls
-                        .sas
-                        .map(|mode| format!("{mode:?}"))
-                        .unwrap_or_else(|| "Off".into())
-                ));
+                let sas_status = vessel.controls.sas.map_or_else(
+                    || "Off".into(),
+                    |mode| {
+                        if matches!(
+                            mode,
+                            SasMode::Prograde
+                                | SasMode::Retrograde
+                                | SasMode::Normal
+                                | SasMode::AntiNormal
+                        ) {
+                            format!(
+                                "{mode:?} ({})",
+                                if sas_uses_surface_reference(vessel) {
+                                    "Surface"
+                                } else {
+                                    "Orbit"
+                                }
+                            )
+                        } else {
+                            format!("{mode:?}")
+                        }
+                    },
+                );
+                ui.label(format!("SAS: {sas_status}"));
                 ui.label(format!(
                     "RCS: {}",
                     if vessel.controls.rcs { "ON" } else { "off" }
@@ -2094,6 +2130,23 @@ mod tests {
             yaw: Some(-0.5),
             roll: Some(0.25),
         }
+    }
+
+    #[test]
+    fn keyboard_focus_neutralizes_local_axes_but_preserves_remote_overrides() {
+        let local = [1.0, -1.0, 0.5];
+        assert_eq!(
+            resolved_attitude_controls(true, local, &RemoteFlightInput::default()),
+            local
+        );
+        assert_eq!(
+            resolved_attitude_controls(false, local, &RemoteFlightInput::default()),
+            [0.0; 3]
+        );
+        assert_eq!(
+            resolved_attitude_controls(false, local, &latched_remote_input()),
+            [1.0, -0.5, 0.25]
+        );
     }
 
     #[test]

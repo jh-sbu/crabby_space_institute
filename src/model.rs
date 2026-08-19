@@ -707,6 +707,8 @@ pub struct Vessel {
     pub attitude: [f64; 4],
     pub angular_velocity: [f64; 3],
     pub controls: FlightControls,
+    #[serde(default)]
+    pub sas_target_attitude: Option<[f64; 4]>,
     pub situation: FlightSituation,
     pub max_heating: f64,
     pub maneuver: Option<ManeuverNode>,
@@ -754,6 +756,7 @@ impl Vessel {
             attitude: [0.0, 0.0, 0.0, 1.0],
             angular_velocity: [0.0; 3],
             controls: FlightControls::default(),
+            sas_target_attitude: None,
             situation: FlightSituation::Prelaunch,
             max_heating: 0.0,
             maneuver: None,

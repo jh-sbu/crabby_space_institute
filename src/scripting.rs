@@ -47,7 +47,7 @@ function on_fixed_update(dt)
 
   if state.phase == 0 and flight.altitude() > 1200 then
     control.set_sas("off")
-    control.set_rotation(0.15, 0.0, 0.0)
+    control.set_rotation(0.30, 0.0, 0.0)
     state.phase = 1
   elseif state.phase == 1 and flight.altitude() > 7000 then
     control.set_rotation(0.0, 0.0, 0.0)
@@ -82,7 +82,7 @@ function main()
   control.stage()
   wait.until_condition(function() return flight.altitude() > 1200 end)
   control.set_sas("off")
-  control.set_rotation(0.15, 0.0, 0.0)
+  control.set_rotation(0.30, 0.0, 0.0)
   wait.until_condition(function() return flight.altitude() > 7000 end)
   control.set_rotation(0.0, 0.0, 0.0)
   control.set_sas("prograde")
@@ -307,8 +307,10 @@ impl ScriptRuntime {
         control.set(
             "set_sas",
             lua.create_function(move |_, mode: String| {
-                let mode = match mode.to_ascii_lowercase().as_str() {
+                let normalized = mode.trim().to_ascii_lowercase();
+                let mode = match normalized.as_str() {
                     "off" => None,
+                    "stability" => Some(SasMode::Stability),
                     "prograde" => Some(SasMode::Prograde),
                     "retrograde" => Some(SasMode::Retrograde),
                     "normal" => Some(SasMode::Normal),
@@ -316,7 +318,11 @@ impl ScriptRuntime {
                     "radial_in" => Some(SasMode::RadialIn),
                     "radial_out" => Some(SasMode::RadialOut),
                     "maneuver" => Some(SasMode::Maneuver),
-                    _ => Some(SasMode::Stability),
+                    _ => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "unknown SAS mode {mode:?}; expected off, stability, prograde, retrograde, normal, antinormal, radial_in, radial_out, or maneuver"
+                        )));
+                    }
                 };
                 commands.lock().unwrap().sas = Some(mode);
                 Ok(())
@@ -530,6 +536,32 @@ mod tests {
             .unwrap();
         let commands = runtime.tick(&telemetry(10.0));
         assert_eq!(commands.throttle, Some(0.75));
+    }
+
+    #[test]
+    fn sas_mode_names_are_validated_instead_of_falling_back_to_stability() {
+        let mut valid = ScriptRuntime::default();
+        valid
+            .load(
+                "function on_fixed_update(dt) control.set_sas('MANEUVER') end".into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            valid.tick(&telemetry(0.0)).sas,
+            Some(Some(SasMode::Maneuver))
+        );
+
+        let mut invalid = ScriptRuntime::default();
+        let error = invalid
+            .load(
+                "function on_start() control.set_sas('retrogade') end".into(),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown SAS mode"), "{error}");
+        assert!(error.contains("retrograde"), "{error}");
     }
 
     #[test]
