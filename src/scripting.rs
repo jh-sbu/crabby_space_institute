@@ -33,6 +33,13 @@ end
 
 function on_fixed_update(dt)
   state.throttle = state.throttle or 1.0
+  if state.phase == 1 then
+    control.set_sas("off")
+    control.set_rotation(0.30, 0.0, 0.0)
+  else
+    control.set_rotation(0.0, 0.0, 0.0)
+  end
+
   if state.phase < 3 then
     regulate_twr(3.2)
   elseif state.phase == 4 then
@@ -620,6 +627,13 @@ mod tests {
 
         for _ in 0..(300 * 60) {
             let before = flight_telemetry(&vessel, &catalog, ut, current.thrust);
+            // The real-time input system refreshes the three momentary attitude
+            // axes every render frame. Guidance must therefore reassert any
+            // intended held input instead of relying on a one-tick command to
+            // remain latched in VesselControls.
+            vessel.controls.pitch = 0.0;
+            vessel.controls.yaw = 0.0;
+            vessel.controls.roll = 0.0;
             let commands = runtime.tick(&before);
             if let Some(value) = commands.throttle {
                 vessel.controls.throttle = value;
