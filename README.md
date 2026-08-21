@@ -32,29 +32,11 @@ The bottom-center navball remains available in camera and map views. It shows ve
 
 ## Lua flight computer
 
-Open the Lua editor in assembly or flight. A script uses either callbacks:
-
-```lua
-state = state or { phase = 0 }
-
-function on_fixed_update(dt)
-  control.set_throttle(1.0)
-  if flight.altitude() > 10000 then
-    control.set_sas("prograde")
-  end
-end
-```
-
-or a yielding mission coroutine:
-
-```lua
-function main()
-  control.set_throttle(1.0)
-  control.stage()
-  wait.until_condition(function() return flight.apoapsis() > 80000 end)
-  control.set_throttle(0.0)
-end
-```
+Open the Lua editor in assembly or flight. Scripts can use callbacks, as shown by
+[`scripts/guided_ascent.lua`](scripts/guided_ascent.lua), or a yielding mission coroutine, as shown
+by [`scripts/coroutine_example.lua`](scripts/coroutine_example.lua). These standalone scripts are
+also used as test fixtures and may evolve independently from the built-in scripts shipped under
+`assets/scripts/`.
 
 Available modules are:
 

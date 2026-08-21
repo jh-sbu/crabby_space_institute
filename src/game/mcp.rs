@@ -22,7 +22,7 @@ use super::{
 };
 use crate::model::{CraftBlueprint, ManeuverNode, PartCatalog, SasMode, ValidationIssue, Vessel};
 use crate::orbit::celestial_system;
-use crate::scripting::{COROUTINE_EXAMPLE, EXAMPLE_SCRIPT, ScriptMode, ScriptRuntime};
+use crate::scripting::{BuiltInScript, BuiltInScripts, LuaScript, ScriptMode, ScriptRuntime};
 use crate::simulation::{MissionProgress, SimulationClock, telemetry};
 
 const DEFAULT_MCP_ADDR: &str = "127.0.0.1:8765";
@@ -489,6 +489,9 @@ fn process_mcp_requests(
     mut view: ResMut<ViewState>,
     mut clock: ResMut<SimulationClock>,
     mut runtime: ResMut<ScriptRuntime>,
+    built_in_scripts: Res<BuiltInScripts>,
+    scripts: Res<Assets<LuaScript>>,
+    asset_server: Res<AssetServer>,
     mut remote_input: ResMut<RemoteFlightInput>,
     mut pending: ResMut<PendingReplies>,
 ) {
@@ -540,6 +543,9 @@ fn process_mcp_requests(
                 &mut view,
                 &mut clock,
                 &mut runtime,
+                &built_in_scripts,
+                &scripts,
+                &asset_server,
                 &mut remote_input,
             ),
             reply,
@@ -604,6 +610,9 @@ fn apply_game_action(
     view: &mut ViewState,
     clock: &mut SimulationClock,
     runtime: &mut ScriptRuntime,
+    built_in_scripts: &BuiltInScripts,
+    scripts: &Assets<LuaScript>,
+    asset_server: &AssetServer,
     remote_input: &mut RemoteFlightInput,
 ) -> Result<(), String> {
     match action {
@@ -611,7 +620,12 @@ fn apply_game_action(
             require_mode(mode, AppMode::Menu)?;
             match action {
                 MenuActionParams::OpenVehicleAssembly => {
-                    enter_vehicle_assembly(session, runtime, next_state);
+                    let source = built_in_scripts.source(
+                        BuiltInScript::GuidedAscent,
+                        scripts,
+                        asset_server,
+                    )?;
+                    enter_vehicle_assembly(session, runtime, next_state, source);
                     Ok(())
                 }
                 MenuActionParams::ContinueQuicksave => continue_quicksave(
@@ -655,9 +669,17 @@ fn apply_game_action(
                 remote_input,
             )
         }
-        GameAction::Script(action) => {
-            apply_script_action(action, mode, session, &store.0, editor, runtime)
-        }
+        GameAction::Script(action) => apply_script_action(
+            action,
+            mode,
+            session,
+            &store.0,
+            editor,
+            runtime,
+            built_in_scripts,
+            scripts,
+            asset_server,
+        ),
         GameAction::View(action) => apply_view_action(action, mode, editor, view),
     }
 }
@@ -974,6 +996,9 @@ fn apply_script_action(
     store: &crate::save::SaveStore,
     editor: &mut EditorState,
     runtime: &mut ScriptRuntime,
+    built_in_scripts: &BuiltInScripts,
+    scripts: &Assets<LuaScript>,
+    asset_server: &AssetServer,
 ) -> Result<(), String> {
     match action {
         ScriptActionParams::SetSource { source } => {
@@ -1010,11 +1035,15 @@ fn apply_script_action(
         }
         ScriptActionParams::LoadCallbackExample => {
             require_mode(mode, AppMode::Editor)?;
-            runtime.source = EXAMPLE_SCRIPT.into();
+            runtime.source = built_in_scripts
+                .source(BuiltInScript::GuidedAscent, scripts, asset_server)?
+                .into();
         }
         ScriptActionParams::LoadCoroutineExample => {
             require_mode(mode, AppMode::Editor)?;
-            runtime.source = COROUTINE_EXAMPLE.into();
+            runtime.source = built_in_scripts
+                .source(BuiltInScript::CoroutineExample, scripts, asset_server)?
+                .into();
         }
         ScriptActionParams::Run => {
             require_mode(mode, AppMode::Flight)?;
@@ -1444,10 +1473,25 @@ impl ServerHandler for GameStateMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scripting::{TEST_COROUTINE_EXAMPLE, TEST_GUIDED_ASCENT};
 
     fn test_app(bridge: GameStateBridge) -> App {
         let mut app = App::new();
-        app.add_plugins(bevy::state::app::StatesPlugin)
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::asset::AssetPlugin::default())
+            .add_plugins(bevy::state::app::StatesPlugin)
+            .init_asset::<LuaScript>();
+        let built_in_scripts = {
+            let mut scripts = app.world_mut().resource_mut::<Assets<LuaScript>>();
+            let guided = scripts.add(LuaScript {
+                source: TEST_GUIDED_ASCENT.into(),
+            });
+            let coroutine = scripts.add(LuaScript {
+                source: TEST_COROUTINE_EXAMPLE.into(),
+            });
+            BuiltInScripts::from_handles(guided, coroutine)
+        };
+        app.insert_resource(built_in_scripts)
             .init_state::<AppMode>()
             .insert_resource(Session::default())
             .insert_resource(Catalog(crate::model::PartCatalog::default()))

@@ -1,4 +1,6 @@
-use bevy::prelude::Resource;
+use bevy::asset::{AssetLoader, LoadContext, LoadState, io::Reader};
+use bevy::prelude::*;
+use bevy::reflect::TypePath;
 use mlua::thread::ThreadStatus;
 use mlua::{Function, HookTriggers, Lua, LuaSerdeExt, Table, Thread, Value, VmState};
 use serde::{Deserialize, Serialize};
@@ -8,8 +10,123 @@ use std::sync::{Arc, Mutex};
 use crate::model::SasMode;
 use crate::simulation::FlightTelemetry;
 
-pub const EXAMPLE_SCRIPT: &str = include_str!("../assets/scripts/guided_ascent.lua");
-pub const COROUTINE_EXAMPLE: &str = include_str!("../assets/scripts/coroutine_example.lua");
+const GUIDED_ASCENT_ASSET: &str = "scripts/guided_ascent.lua";
+const COROUTINE_EXAMPLE_ASSET: &str = "scripts/coroutine_example.lua";
+
+#[cfg(test)]
+pub(crate) const TEST_GUIDED_ASCENT: &str = include_str!("../scripts/guided_ascent.lua");
+#[cfg(test)]
+pub(crate) const TEST_COROUTINE_EXAMPLE: &str = include_str!("../scripts/coroutine_example.lua");
+
+#[derive(Asset, TypePath, Debug)]
+pub(crate) struct LuaScript {
+    pub source: String,
+}
+
+#[derive(Default, TypePath)]
+struct LuaScriptLoader;
+
+impl AssetLoader for LuaScriptLoader {
+    type Asset = LuaScript;
+    type Settings = ();
+    type Error = std::io::Error;
+
+    async fn load(
+        &self,
+        reader: &mut dyn Reader,
+        _settings: &Self::Settings,
+        _load_context: &mut LoadContext<'_>,
+    ) -> Result<Self::Asset, Self::Error> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        let source = String::from_utf8(bytes).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error())
+        })?;
+        Ok(LuaScript { source })
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["lua"]
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BuiltInScript {
+    GuidedAscent,
+    CoroutineExample,
+}
+
+impl BuiltInScript {
+    fn name(self) -> &'static str {
+        match self {
+            Self::GuidedAscent => "guided_ascent.lua",
+            Self::CoroutineExample => "coroutine_example.lua",
+        }
+    }
+}
+
+#[derive(Resource)]
+pub(crate) struct BuiltInScripts {
+    guided_ascent: Handle<LuaScript>,
+    coroutine_example: Handle<LuaScript>,
+}
+
+impl BuiltInScripts {
+    fn load(asset_server: &AssetServer) -> Self {
+        Self {
+            guided_ascent: asset_server.load(GUIDED_ASCENT_ASSET),
+            coroutine_example: asset_server.load(COROUTINE_EXAMPLE_ASSET),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_handles(
+        guided_ascent: Handle<LuaScript>,
+        coroutine_example: Handle<LuaScript>,
+    ) -> Self {
+        Self {
+            guided_ascent,
+            coroutine_example,
+        }
+    }
+
+    fn handle(&self, script: BuiltInScript) -> &Handle<LuaScript> {
+        match script {
+            BuiltInScript::GuidedAscent => &self.guided_ascent,
+            BuiltInScript::CoroutineExample => &self.coroutine_example,
+        }
+    }
+
+    pub(crate) fn source<'a>(
+        &self,
+        script: BuiltInScript,
+        scripts: &'a Assets<LuaScript>,
+        asset_server: &AssetServer,
+    ) -> Result<&'a str, String> {
+        let handle = self.handle(script);
+        if let Some(asset) = scripts.get(handle) {
+            return Ok(&asset.source);
+        }
+        match asset_server.get_load_state(handle) {
+            Some(LoadState::Failed(error)) => {
+                Err(format!("Could not load {}: {error}", script.name()))
+            }
+            _ => Err(format!("{} is still loading", script.name())),
+        }
+    }
+}
+
+pub(crate) struct ScriptingPlugin;
+
+impl Plugin for ScriptingPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_asset::<LuaScript>()
+            .init_asset_loader::<LuaScriptLoader>()
+            .init_resource::<ScriptRuntime>();
+        let scripts = BuiltInScripts::load(app.world().resource::<AssetServer>());
+        app.insert_resource(scripts);
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScriptCommands {
@@ -67,7 +184,7 @@ impl Default for ScriptRuntime {
             commands: Arc::new(Mutex::new(ScriptCommands::default())),
             logs: Arc::new(Mutex::new(Vec::new())),
             instruction_counter: Arc::new(AtomicUsize::new(0)),
-            source: EXAMPLE_SCRIPT.into(),
+            source: String::new(),
             active: false,
             mode: None,
             last_error: None,
@@ -490,6 +607,98 @@ mod tests {
     }
 
     #[test]
+    fn coroutine_example_runs_through_each_yield() {
+        let mut runtime = ScriptRuntime::default();
+        runtime.load(TEST_COROUTINE_EXAMPLE.into(), None).unwrap();
+
+        let ignition = runtime.tick(&telemetry(0.0));
+        assert_eq!(ignition.throttle, Some(1.0));
+        assert!(ignition.stage);
+
+        let gravity_turn = runtime.tick(&telemetry(1_300.0));
+        assert_eq!(gravity_turn.pitch, Some(0.3));
+
+        let booster_separation = runtime.tick(&telemetry(7_100.0));
+        assert!(booster_separation.stage);
+        assert_eq!(booster_separation.sas, Some(Some(SasMode::Prograde)));
+
+        let cutoff = runtime.tick(&telemetry(91_000.0));
+        assert_eq!(cutoff.throttle, Some(0.0));
+    }
+
+    #[test]
+    fn shipped_scripts_load_through_bevy() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::asset::AssetPlugin::default())
+            .add_plugins(ScriptingPlugin);
+
+        {
+            let world = app.world();
+            let handles = world.resource::<BuiltInScripts>();
+            let scripts = world.resource::<Assets<LuaScript>>();
+            let asset_server = world.resource::<AssetServer>();
+            let error = handles
+                .source(BuiltInScript::GuidedAscent, scripts, asset_server)
+                .unwrap_err();
+            assert!(error.contains("still loading"), "{error}");
+        }
+
+        for _ in 0..1_000 {
+            app.update();
+            let world = app.world();
+            let handles = world.resource::<BuiltInScripts>();
+            let scripts = world.resource::<Assets<LuaScript>>();
+            let guided = scripts.get(handles.handle(BuiltInScript::GuidedAscent));
+            let coroutine = scripts.get(handles.handle(BuiltInScript::CoroutineExample));
+            if let (Some(guided), Some(coroutine)) = (guided, coroutine) {
+                assert!(guided.source.contains("function on_fixed_update"));
+                assert!(coroutine.source.contains("function main"));
+                return;
+            }
+            std::thread::yield_now();
+        }
+
+        let world = app.world();
+        let handles = world.resource::<BuiltInScripts>();
+        let asset_server = world.resource::<AssetServer>();
+        panic!(
+            "Lua assets did not load: guided={:?}, coroutine={:?}",
+            asset_server.get_load_state(handles.handle(BuiltInScript::GuidedAscent)),
+            asset_server.get_load_state(handles.handle(BuiltInScript::CoroutineExample)),
+        );
+    }
+
+    #[test]
+    fn missing_script_reports_the_asset_failure() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::asset::AssetPlugin::default())
+            .add_plugins(ScriptingPlugin);
+        let missing = app
+            .world()
+            .resource::<AssetServer>()
+            .load::<LuaScript>("scripts/missing.lua");
+        let handles = BuiltInScripts::from_handles(missing.clone(), missing);
+
+        for _ in 0..1_000 {
+            app.update();
+            let world = app.world();
+            let scripts = world.resource::<Assets<LuaScript>>();
+            let asset_server = world.resource::<AssetServer>();
+            let error = handles
+                .source(BuiltInScript::GuidedAscent, scripts, asset_server)
+                .unwrap_err();
+            if error.starts_with("Could not load") {
+                return;
+            }
+            std::thread::yield_now();
+        }
+
+        panic!("missing Lua asset never reached the failed state");
+    }
+
+    #[test]
     fn unsafe_libraries_are_absent() {
         let mut runtime = ScriptRuntime::default();
         runtime.load("function on_fixed_update(dt) assert(os == nil and io == nil and require == nil) end".into(), None).unwrap();
@@ -524,7 +733,7 @@ mod tests {
         let catalog = PartCatalog::default();
         let mut vessel = Vessel::from_blueprint(&stock_craft(), &catalog);
         let mut runtime = ScriptRuntime::default();
-        runtime.load(EXAMPLE_SCRIPT.into(), None).unwrap();
+        runtime.load(TEST_GUIDED_ASCENT.into(), None).unwrap();
 
         let dt = 1.0 / 60.0;
         let mut ut = 0.0;

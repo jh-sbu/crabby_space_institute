@@ -16,7 +16,7 @@ use crate::orbit::{
     body_definition, celestial_system, circular_ephemeris, sample_trajectory, vessel_root_state,
 };
 use crate::save::{QuickSave, SAVE_SCHEMA, SaveStore};
-use crate::scripting::{COROUTINE_EXAMPLE, EXAMPLE_SCRIPT, ScriptRuntime};
+use crate::scripting::{BuiltInScript, BuiltInScripts, LuaScript, ScriptRuntime, ScriptingPlugin};
 use crate::simulation::{
     FlightTelemetry, MissionProgress, SimulationClock, activate_next_stage,
     craft_stage_performance, craft_stats, on_rails_warp_is_safe, remaining_stage_performance,
@@ -156,6 +156,7 @@ pub fn run() {
         ..default()
     }))
     .add_plugins(EguiPlugin::default())
+    .add_plugins(ScriptingPlugin)
     .insert_resource(ClearColor(Color::srgb(0.004, 0.008, 0.02)))
     .insert_resource(Time::<Fixed>::from_hz(60.0))
     .insert_resource(Catalog(PartCatalog::default()))
@@ -165,7 +166,6 @@ pub fn run() {
     .init_resource::<ViewState>()
     .init_resource::<RemoteFlightInput>()
     .init_resource::<SimulationClock>()
-    .init_resource::<ScriptRuntime>()
     .init_state::<AppMode>()
     .add_systems(Startup, setup_world)
     .add_systems(
@@ -977,6 +977,9 @@ fn game_ui(
     mut view: ResMut<ViewState>,
     mut clock: ResMut<SimulationClock>,
     mut runtime: ResMut<ScriptRuntime>,
+    built_in_scripts: Res<BuiltInScripts>,
+    scripts: Res<Assets<LuaScript>>,
+    asset_server: Res<AssetServer>,
     mut remote_input: ResMut<RemoteFlightInput>,
     mut app_exit: MessageWriter<AppExit>,
 ) -> Result {
@@ -1008,6 +1011,9 @@ fn game_ui(
             &store.0,
             &mut clock,
             &mut runtime,
+            &built_in_scripts,
+            &scripts,
+            &asset_server,
             &mut view,
             &mut remote_input,
             &mut app_exit,
@@ -1021,6 +1027,9 @@ fn game_ui(
             &store.0,
             &mut editor,
             &mut runtime,
+            &built_in_scripts,
+            &scripts,
+            &asset_server,
             &mut remote_input,
         ),
         AppMode::Flight => flight_ui(
@@ -1046,6 +1055,9 @@ fn menu_ui(
     store: &SaveStore,
     clock: &mut SimulationClock,
     runtime: &mut ScriptRuntime,
+    built_in_scripts: &BuiltInScripts,
+    scripts: &Assets<LuaScript>,
+    asset_server: &AssetServer,
     view: &mut ViewState,
     remote_input: &mut RemoteFlightInput,
     app_exit: &mut MessageWriter<AppExit>,
@@ -1057,8 +1069,20 @@ fn menu_ui(
             ui.heading(egui::RichText::new("CRABBY SPACE INSTITUTE").size(40.0).strong());
             ui.label(egui::RichText::new("Per aspera ad astacum").italics().color(egui::Color32::from_rgb(227, 158, 96)));
             ui.add_space(30.0);
-            if ui.add_sized([260.0, 42.0], egui::Button::new("Vehicle Assembly")).clicked() {
-                enter_vehicle_assembly(session, runtime, next_state);
+            let guided_ascent = built_in_scripts.source(
+                BuiltInScript::GuidedAscent,
+                scripts,
+                asset_server,
+            );
+            if ui
+                .add_enabled_ui(guided_ascent.is_ok(), |ui| {
+                    ui.add_sized([260.0, 42.0], egui::Button::new("Vehicle Assembly"))
+                })
+                .inner
+                .clicked()
+                && let Ok(source) = guided_ascent
+            {
+                enter_vehicle_assembly(session, runtime, next_state, source);
             }
             if store.quicksave_exists() && ui.add_sized([260.0, 42.0], egui::Button::new("Continue Quicksave")).clicked() {
                 let _ = continue_quicksave(
@@ -1073,6 +1097,13 @@ fn menu_ui(
             }
             if ui.add_sized([260.0, 42.0], egui::Button::new("Quit")).clicked() { app_exit.write(AppExit::Success); }
             ui.add_space(24.0);
+            if let Err(error) = built_in_scripts.source(
+                BuiltInScript::GuidedAscent,
+                scripts,
+                asset_server,
+            ) {
+                ui.label(egui::RichText::new(error).color(egui::Color32::YELLOW));
+            }
             ui.label("3D construction · staged rockets · aerothermal return · patched-conic map · Lua autopilot");
             ui.label(egui::RichText::new(&session.notice).color(egui::Color32::LIGHT_BLUE));
         });
@@ -1083,12 +1114,13 @@ fn enter_vehicle_assembly(
     session: &mut Session,
     runtime: &mut ScriptRuntime,
     next_state: &mut NextState<AppMode>,
+    guided_ascent: &str,
 ) {
     session.craft = stock_craft();
     session.vessel = None;
     session.visual_dirty = true;
     session.notice = "Stock Pathfinder loaded. Modify it or launch as-is.".into();
-    runtime.source = EXAMPLE_SCRIPT.into();
+    runtime.source = guided_ascent.into();
     next_state.set(AppMode::Editor);
 }
 
@@ -1141,6 +1173,9 @@ fn editor_ui(
     store: &SaveStore,
     editor: &mut EditorState,
     runtime: &mut ScriptRuntime,
+    built_in_scripts: &BuiltInScripts,
+    scripts: &Assets<LuaScript>,
+    asset_server: &AssetServer,
     remote_input: &mut RemoteFlightInput,
 ) {
     let mut action = None;
@@ -1279,8 +1314,25 @@ fn editor_ui(
                 if ui.button("Load").clicked() {
                     match store.load_script(&editor.script_name) { Ok(source) => runtime.source = source, Err(error) => session.notice = format!("Script load failed: {error}") }
                 }
-                if ui.button("Callback example").clicked() { runtime.source = EXAMPLE_SCRIPT.into(); }
-                if ui.button("Coroutine example").clicked() { runtime.source = COROUTINE_EXAMPLE.into(); }
+                let callback = built_in_scripts.source(
+                    BuiltInScript::GuidedAscent,
+                    scripts,
+                    asset_server,
+                );
+                let response = ui.add_enabled(callback.is_ok(), egui::Button::new("Callback example"));
+                let clicked = response.clicked();
+                if let Err(error) = &callback { response.on_hover_text(error); }
+                if clicked && let Ok(source) = callback { runtime.source = source.into(); }
+
+                let coroutine = built_in_scripts.source(
+                    BuiltInScript::CoroutineExample,
+                    scripts,
+                    asset_server,
+                );
+                let response = ui.add_enabled(coroutine.is_ok(), egui::Button::new("Coroutine example"));
+                let clicked = response.clicked();
+                if let Err(error) = &coroutine { response.on_hover_text(error); }
+                if clicked && let Ok(source) = coroutine { runtime.source = source.into(); }
             });
             ui.add(egui::TextEdit::multiline(&mut runtime.source).font(egui::TextStyle::Monospace).desired_rows(25).desired_width(f32::INFINITY));
             ui.small("API: flight.*, resources.*, control.set_throttle/rotation/sas/rcs/stage/deploy_parachutes, nav.set_warp/set_maneuver, wait.*, log.info");
